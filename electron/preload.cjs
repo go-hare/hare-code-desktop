@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-// Expose safe APIs to the renderer process
+// Expose safe APIs to the renderer process 
 contextBridge.exposeInMainWorld('electronAPI', {
     apiBase: process.env.CCMINI_API_BASE || '',
     // Zoom change listener
