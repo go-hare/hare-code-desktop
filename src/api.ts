@@ -65,12 +65,11 @@ export interface RuntimeDependencyStatus {
 
 export interface SystemStatus {
   platform: string;
-  npm: RuntimeDependencyStatus;
   bun: RuntimeDependencyStatus;
-  hareCode: RuntimeDependencyStatus;
+  hareCode: RuntimeDependencyStatus & { install_url?: string | null };
 }
 
-// 系统状态（检测 npm / bun / hare-code 等运行时依赖）
+// 系统状态（检测 hare-code 二进制 / 兼容包装器 等运行时依赖）
 export async function getSystemStatus(): Promise<SystemStatus> {
   const res = await fetch(`${API_BASE}/system-status`);
   if (!res.ok) throw new Error('Failed to get system status');

@@ -292,9 +292,8 @@ const Layout = () => {
   const [runtimeStatus, setRuntimeStatus] = useState<SystemStatus | null>(null);
 
   const hasRuntimeGap = (status: SystemStatus) => (
-    (status.npm.required && !status.npm.found)
+    (status.hareCode.required && !status.hareCode.found)
     || (status.bun.required && !status.bun.found)
-    || (status.hareCode.required && !status.hareCode.found)
   );
 
   // Check runtime dependencies needed by the desktop backend

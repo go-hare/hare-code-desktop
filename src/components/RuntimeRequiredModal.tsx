@@ -6,9 +6,9 @@ interface Props {
   onResolved: (status: SystemStatus) => void;
 }
 
-const NODE_DOWNLOAD_URL = 'https://nodejs.org/en/download';
 const BUN_DOWNLOAD_URL = 'https://bun.sh/';
 const HARE_CODE_REPO_URL = 'https://github.com/go-hare/hare-code';
+const HARE_CODE_RELEASES_URL = `${HARE_CODE_REPO_URL}/releases`;
 
 const RuntimeRequiredModal: React.FC<Props> = ({ initialStatus, onResolved }) => {
   const [status, setStatus] = useState<SystemStatus>(initialStatus);
@@ -17,7 +17,6 @@ const RuntimeRequiredModal: React.FC<Props> = ({ initialStatus, onResolved }) =>
   const [error, setError] = useState<string | null>(null);
 
   const missing = useMemo(() => ({
-    npm: status.npm.required && !status.npm.found,
     bun: status.bun.required && !status.bun.found,
     hareCode: status.hareCode.required && !status.hareCode.found,
   }), [status]);
@@ -35,12 +34,8 @@ const RuntimeRequiredModal: React.FC<Props> = ({ initialStatus, onResolved }) =>
   const refreshStatus = async () => {
     const next = await getSystemStatus();
     setStatus(next);
-    if (!next.npm.required || next.npm.found) {
-      if (!next.bun.required || next.bun.found) {
-        if (!next.hareCode.required || next.hareCode.found) {
-          onResolved(next);
-        }
-      }
+    if ((!next.hareCode.required || next.hareCode.found) && (!next.bun.required || next.bun.found)) {
+      onResolved(next);
     }
     return next;
   };
@@ -50,7 +45,7 @@ const RuntimeRequiredModal: React.FC<Props> = ({ initialStatus, onResolved }) =>
     setError(null);
     try {
       const next = await refreshStatus();
-      if ((next.npm.required && !next.npm.found) || (next.bun.required && !next.bun.found) || (next.hareCode.required && !next.hareCode.found)) {
+      if ((next.bun.required && !next.bun.found) || (next.hareCode.required && !next.hareCode.found)) {
         setError('仍有运行时依赖未就绪。请完成安装后再试。');
       }
     } catch (err: any) {
@@ -67,23 +62,17 @@ const RuntimeRequiredModal: React.FC<Props> = ({ initialStatus, onResolved }) =>
       await installHareCode();
       await refreshStatus();
     } catch (err: any) {
-      setError(err?.message || '安装 hare-code 失败');
+      setError(err?.message || '下载 hare-code 二进制失败');
     } finally {
       setInstalling(false);
     }
   };
 
-  const title = missing.npm
-    ? '需要安装 Node.js / npm'
-    : missing.bun
-      ? '需要安装 Bun'
-      : '需要安装 hare-code';
+  const title = missing.bun ? '需要安装 Bun' : '需要安装 hare-code';
 
-  const description = missing.npm
-    ? '桌面端会通过 npm 安装 hare-code 的 release 包，请先安装 Node.js 与 npm。'
-    : missing.bun
-      ? '你当前发布的 hare-code v1.0.0 运行时仍依赖 Bun，请先安装 Bun。'
-      : '未检测到本机 hare-code 命令。桌面端会直接执行 npm install -g 安装 release 包。';
+  const description = missing.bun
+    ? '当前检测到的 hare-code 是基于 Bun 的包装命令。请先安装 Bun，或改用 release 二进制。'
+    : '未检测到本机 hare-code。桌面端会直接下载当前平台对应的 release 二进制。';
 
   return (
     <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm">
@@ -104,9 +93,6 @@ const RuntimeRequiredModal: React.FC<Props> = ({ initialStatus, onResolved }) =>
 
         <div className="rounded-lg bg-claude-hover/50 p-3.5 mb-4 space-y-1.5">
           <p className="text-[12.5px] text-claude-text leading-relaxed">
-            npm: <span className={missing.npm ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'}>{missing.npm ? '未就绪' : '已就绪'}</span>
-          </p>
-          <p className="text-[12.5px] text-claude-text leading-relaxed">
             Bun: <span className={missing.bun ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'}>{missing.bun ? '未就绪' : '已就绪'}</span>
           </p>
           <p className="text-[12.5px] text-claude-text leading-relaxed">
@@ -124,16 +110,7 @@ const RuntimeRequiredModal: React.FC<Props> = ({ initialStatus, onResolved }) =>
         )}
 
         <div className="flex flex-col gap-2">
-          {missing.npm ? (
-            <button
-              onClick={() => openExternal(NODE_DOWNLOAD_URL)}
-              className="w-full px-4 py-2.5 rounded-lg bg-claude-text text-claude-bg text-[14px] font-medium hover:opacity-90 transition-opacity"
-            >
-              打开 Node.js 安装页
-            </button>
-          ) : null}
-
-          {!missing.npm && missing.bun ? (
+          {missing.bun ? (
             <button
               onClick={() => openExternal(BUN_DOWNLOAD_URL)}
               className="w-full px-4 py-2.5 rounded-lg bg-claude-text text-claude-bg text-[14px] font-medium hover:opacity-90 transition-opacity"
@@ -142,20 +119,20 @@ const RuntimeRequiredModal: React.FC<Props> = ({ initialStatus, onResolved }) =>
             </button>
           ) : null}
 
-          {!missing.npm && missing.hareCode ? (
+          {missing.hareCode ? (
             <>
               <button
                 onClick={handleInstallHareCode}
                 disabled={installing}
                 className="w-full px-4 py-2.5 rounded-lg bg-claude-text text-claude-bg text-[14px] font-medium hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {installing ? '安装中...' : '安装 hare-code release'}
+                {installing ? '下载中...' : '下载 hare-code 二进制'}
               </button>
               <button
-                onClick={() => openExternal(HARE_CODE_REPO_URL)}
+                onClick={() => openExternal(HARE_CODE_RELEASES_URL)}
                 className="w-full px-4 py-2.5 rounded-lg border border-claude-border text-claude-text text-[14px] font-medium hover:bg-claude-hover transition-colors"
               >
-                打开 hare-code 仓库
+                打开 hare-code 发布页
               </button>
             </>
           ) : null}

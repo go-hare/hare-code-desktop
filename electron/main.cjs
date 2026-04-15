@@ -15,7 +15,8 @@ const TITLE_BAR_BASE_HEIGHT = 44;
 const DEBUG_LOG = path.join(os.homedir(), 'AppData', 'Roaming', 'ccmini-desktop', 'main-debug.log');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_SKILLS_ROOT = path.join(CODEX_HOME, 'skills');
-const HARE_CODE_RELEASE_URL = 'https://github.com/go-hare/hare-code/releases/download/v1.0.0/hare-code-1.0.0.tgz';
+const HARE_CODE_RELEASE_REPO = 'go-hare/hare-code';
+const HARE_CODE_RELEASE_VERSION = process.env.HARE_CODE_RELEASE_VERSION || '1.0.0';
 
 let mainWindow = null;
 let apiServer = null;
@@ -24,6 +25,7 @@ let currentWorkspace = PROJECT_ROOT;
 let statePath = '';
 let uploadsDir = '';
 let customSkillsDir = '';
+let hareCodeRuntimeDir = '';
 const activeRuns = new Map();
 let state = null;
 let installingHareCodePromise = null;
@@ -177,6 +179,63 @@ function detectNpmBinary() {
   return { found: Boolean(command), path: command };
 }
 
+function getHareCodeBinaryAssetName() {
+  if (process.platform === 'win32' && process.arch === 'x64') return 'hare-code-windows-x64.exe';
+  if (process.platform === 'linux' && process.arch === 'x64') return 'hare-code-linux-x64-baseline';
+  if (process.platform === 'linux' && process.arch === 'arm64') return 'hare-code-linux-arm64';
+  if (process.platform === 'darwin' && process.arch === 'x64') return 'hare-code-darwin-x64';
+  if (process.platform === 'darwin' && process.arch === 'arm64') return 'hare-code-darwin-arm64';
+  return null;
+}
+
+function getHareCodeReleaseBinaryUrl() {
+  const assetName = getHareCodeBinaryAssetName();
+  if (!assetName) return null;
+  return `https://github.com/${HARE_CODE_RELEASE_REPO}/releases/download/v${HARE_CODE_RELEASE_VERSION}/${assetName}`;
+}
+
+function managedHareCodeCandidates() {
+  const assetName = getHareCodeBinaryAssetName();
+  if (!hareCodeRuntimeDir || !assetName) return [];
+  return [path.join(hareCodeRuntimeDir, assetName)];
+}
+
+function readFilePreview(filePath, maxBytes = 4096) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buffer = Buffer.alloc(maxBytes);
+      const size = fs.readSync(fd, buffer, 0, maxBytes, 0);
+      return buffer.toString('utf8', 0, size);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return '';
+  }
+}
+
+function commandNeedsBunRuntime(command) {
+  if (!command) return false;
+  const normalized = String(command).toLowerCase();
+  if (/\.(cmd|bat|ps1)$/i.test(normalized)) {
+    return true;
+  }
+  if (!path.isAbsolute(command)) {
+    return false;
+  }
+  try {
+    const resolvedPath = fs.realpathSync(command);
+    const preview = readFilePreview(resolvedPath);
+    if (!preview) return false;
+    return preview.includes('/usr/bin/env bun')
+      || preview.includes('spawn(bunBinary')
+      || preview.includes('hare-code 需要 Bun 运行时');
+  } catch {
+    return false;
+  }
+}
+
 function detectHareCodeBinary() {
   const roamingNpmDir = path.join(os.homedir(), 'AppData', 'Roaming', 'npm');
   const npm = detectNpmBinary();
@@ -191,6 +250,7 @@ function detectHareCodeBinary() {
     : [];
   const candidates = uniqueValues([
     process.env.HARE_CODE_BIN,
+    ...managedHareCodeCandidates(),
     path.join(roamingNpmDir, 'hare-code.cmd'),
     path.join(roamingNpmDir, 'hare-code.exe'),
     path.join(roamingNpmDir, 'hare-code'),
@@ -203,23 +263,21 @@ function detectHareCodeBinary() {
   return {
     found: Boolean(command),
     path: command,
-    managed: Boolean(command && npmPrefix && command.startsWith(npmPrefix)),
+    managed: Boolean(command && (
+      (hareCodeRuntimeDir && command.startsWith(hareCodeRuntimeDir))
+      || (npmPrefix && command.startsWith(npmPrefix))
+    )),
   };
 }
 
 function systemStatusPayload() {
-  const npm = detectNpmBinary();
-  const bun = detectBunBinary();
   const hareCode = detectHareCodeBinary();
+  const bun = detectBunBinary();
+  const hareCodeNeedsBun = commandNeedsBunRuntime(hareCode.path);
   return {
     platform: process.platform,
-    npm: {
-      required: !hareCode.found,
-      found: npm.found,
-      path: npm.path,
-    },
     bun: {
-      required: true,
+      required: hareCodeNeedsBun,
       found: bun.found,
       path: bun.path,
     },
@@ -228,6 +286,7 @@ function systemStatusPayload() {
       found: hareCode.found,
       path: hareCode.path,
       managed: hareCode.managed,
+      install_url: getHareCodeReleaseBinaryUrl(),
     },
   };
 }
@@ -235,37 +294,25 @@ function systemStatusPayload() {
 async function installManagedHareCode() {
   if (installingHareCodePromise) return installingHareCodePromise;
   installingHareCodePromise = (async () => {
-    const status = systemStatusPayload();
-    const npm = detectNpmBinary();
-    if (!npm.found || !npm.path) {
-      throw new Error('未检测到 npm，请先安装 Node.js。');
+    const downloadUrl = getHareCodeReleaseBinaryUrl();
+    const assetName = getHareCodeBinaryAssetName();
+    if (!downloadUrl || !assetName) {
+      throw new Error(`当前平台暂不支持自动安装 hare-code 二进制：${process.platform}/${process.arch}`);
     }
-
-    await new Promise((resolve, reject) => {
-      const child = spawnCommand(npm.path, ['install', '-g', '--no-fund', '--no-audit', HARE_CODE_RELEASE_URL], {
-        cwd: PROJECT_ROOT,
-        env: { ...process.env },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-      child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-      child.on('error', reject);
-      child.on('close', (code) => {
-        if (code === 0) {
-          resolve();
-          return;
-        }
-        reject(new Error((stderr || stdout || `npm exited with code ${code}`).trim()));
-      });
-    });
+    ensureDir(hareCodeRuntimeDir);
+    const targetPath = path.join(hareCodeRuntimeDir, assetName);
+    const response = await fetch(downloadUrl);
+    if (!response.ok) {
+      throw new Error(`下载 hare-code 二进制失败：HTTP ${response.status}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    fs.writeFileSync(targetPath, buffer);
+    if (process.platform !== 'win32') {
+      fs.chmodSync(targetPath, 0o755);
+    }
 
     const hareCode = detectHareCodeBinary();
     if (!hareCode.found) {
-      if (!status.bun.found) {
-        throw new Error('hare-code 已安装，但当前发布包仍依赖 Bun 运行时。请先安装 Bun。');
-      }
       throw new Error('hare-code 安装完成，但未检测到可执行命令。');
     }
     return hareCode;
@@ -984,6 +1031,10 @@ function runViaCli({ conversation, provider, prompt, workspacePath, onText, onDo
   }
   const sessionId = conversation.backend_session_id || randomUUID();
   const bun = detectBunBinary();
+  if (commandNeedsBunRuntime(hareCode.path) && (!bun.found || !bun.path)) {
+    onError('当前 hare-code 仍依赖 Bun 运行时，请先安装 Bun，或改用 GitHub Release 二进制。');
+    return;
+  }
   let env = { ...process.env, ANTHROPIC_BASE_URL: provider.baseUrl || '', ANTHROPIC_API_KEY: provider.apiKey || '', ANTHROPIC_AUTH_TOKEN: provider.apiKey || '' };
   if (bun.found && bun.path) {
     env = withPrependedPath(env, path.dirname(bun.path));
@@ -1771,6 +1822,7 @@ app.whenReady().then(async () => {
   statePath = path.join(app.getPath('userData'), 'ccmini-state.json');
   uploadsDir = path.join(app.getPath('userData'), 'uploads');
   customSkillsDir = path.join(app.getPath('userData'), 'skills');
+  hareCodeRuntimeDir = path.join(app.getPath('userData'), 'hare-code-runtime');
   state = loadState();
   syncChatModelsFromProviders();
   apiBase = await startApiServer();
