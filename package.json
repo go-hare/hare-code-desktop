@@ -1,8 +1,8 @@
 {
-  "name": "ccmini-desktop",
+  "name": "hare-desktop",
   "private": true,
-  "version": "1.6.8",
-  "description": "ccmini donor-style desktop frontend",
+  "version": "1.0.0",
+  "description": "hare donor-style desktop frontend",
   "author": {
     "name": "pretend1111",
     "email": "pretend1111@users.noreply.github.com"
@@ -10,18 +10,26 @@
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
+    "sdk:build": "node ./scripts/sync-hare-sdk.cjs",
+    "sdk:build:package": "node ./scripts/sync-hare-sdk.cjs --source=package",
+    "version:sync": "node ../hare-code/scripts/sync-sibling-version.mjs --only hare-code-desktop",
+    "version:check": "node ../hare-code/scripts/check-sibling-version.mjs --only hare-code-desktop",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "electron:dev": "vite build && node ./scripts/run-electron.cjs",
-    "electron:build": "vite build && electron-builder",
-    "electron:build:win": "vite build && electron-builder --win",
-    "electron:build:mac": "vite build && electron-builder --mac",
-    "electron:build:linux": "vite build && electron-builder --linux"
+    "electron:dev": "bun run sdk:build && vite build && node ./scripts/run-electron.cjs",
+    "electron:build": "bun run sdk:build && vite build && electron-builder",
+    "electron:build:win": "bun run sdk:build && vite build && electron-builder --win",
+    "electron:build:mac": "bun run sdk:build && vite build && electron-builder --mac",
+    "electron:build:linux": "bun run sdk:build && vite build && electron-builder --linux",
+    "electron:build:release": "bun run sdk:build:package && vite build && electron-builder",
+    "electron:build:release:win": "bun run sdk:build:package && vite build && electron-builder --win",
+    "electron:build:release:mac": "bun run sdk:build:package && vite build && electron-builder --mac",
+    "electron:build:release:linux": "bun run sdk:build:package && vite build && electron-builder --linux"
   },
   "build": {
-    "appId": "com.ccmini.desktop",
-    "productName": "ccmini Desktop",
+    "appId": "com.hare.desktop",
+    "productName": "hare Desktop",
     "directories": {
       "output": "release"
     },

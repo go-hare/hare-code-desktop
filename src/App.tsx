@@ -4,7 +4,7 @@ import { FileText, ChevronDown, Trash, Pencil, Star, Menu, Folder, ArrowLeft, Ar
 import Sidebar from './components/Sidebar';
 import MainContent from './components/MainContent';
 import { IconSidebarToggle } from './components/Icons';
-import { buildApiUrl, updateConversation, deleteConversation, exportConversation, getConversation, getSystemStatus, SystemStatus } from './api';
+import { buildApiUrl, updateConversation, deleteConversation, exportConversation, getConversation } from './api';
 import Onboarding from './components/Onboarding';
 import SettingsPage from './components/SettingsPage';
 import DocumentPanel from './components/DocumentPanel';
@@ -15,7 +15,6 @@ import { DocumentInfo } from './components/DocumentCard';
 import ChatsPage from './components/ChatsPage';
 import CustomizePage from './components/CustomizePage';
 import ProjectsPage from './components/ProjectsPage';
-import RuntimeRequiredModal from './components/RuntimeRequiredModal';
 
 const Tooltip = ({ children, text, shortcut }: { children: React.ReactNode; text: string; shortcut?: string }) => {
   const [show, setShow] = useState(false);
@@ -289,30 +288,6 @@ const Layout = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [showUpgrade] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
-  const [runtimeStatus, setRuntimeStatus] = useState<SystemStatus | null>(null);
-
-  const hasRuntimeGap = (status: SystemStatus) => (
-    (status.hareCode.required && !status.hareCode.found)
-    || (status.bun.required && !status.bun.found)
-  );
-
-  // Check runtime dependencies needed by the desktop backend
-  useEffect(() => {
-    let cancelled = false;
-    const check = async () => {
-      try {
-        const status = await getSystemStatus();
-        if (cancelled) return;
-        setRuntimeStatus(hasRuntimeGap(status) ? status : null);
-      } catch {
-        // Bridge server not ready yet — retry shortly
-        if (!cancelled) setTimeout(check, 1500);
-      }
-    };
-    check();
-    return () => { cancelled = true; };
-  }, []);
-
   // Document panel state
   const [documentPanelDoc, setDocumentPanelDoc] = useState<DocumentInfo | null>(null);
   const [showArtifacts, setShowArtifacts] = useState(false);
@@ -637,11 +612,6 @@ const Layout = () => {
     toggleAbsTop: 11,
     toggleAbsLeft: 8, // Collapsed State Left Position
   });
-
-  // Runtime dependencies required: block app until ready
-  if (runtimeStatus) {
-    return <RuntimeRequiredModal initialStatus={runtimeStatus} onResolved={() => setRuntimeStatus(null)} />;
-  }
 
   // Onboarding: show on first launch
   if (showOnboarding) {

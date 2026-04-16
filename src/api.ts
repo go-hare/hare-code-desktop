@@ -56,35 +56,6 @@ async function request(path: string, options: RequestInit = {}) {
   return res;
 }
 
-export interface RuntimeDependencyStatus {
-  required: boolean;
-  found: boolean;
-  path: string | null;
-  managed?: boolean;
-}
-
-export interface SystemStatus {
-  platform: string;
-  bun: RuntimeDependencyStatus;
-  hareCode: RuntimeDependencyStatus & { install_url?: string | null };
-}
-
-// 系统状态（检测 hare-code 二进制 / 兼容包装器 等运行时依赖）
-export async function getSystemStatus(): Promise<SystemStatus> {
-  const res = await fetch(`${API_BASE}/system-status`);
-  if (!res.ok) throw new Error('Failed to get system status');
-  return res.json();
-}
-
-export async function installHareCode(): Promise<{ ok: boolean; path?: string | null }> {
-  const res = await fetch(`${API_BASE}/system/install-hare-code`, { method: 'POST' });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.error || 'Failed to install hare-code');
-  }
-  return res.json();
-}
-
 // 认证相关
 export async function sendCode(email: string) {
   const res = await request('/auth/send-code', {

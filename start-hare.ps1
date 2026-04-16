@@ -24,7 +24,7 @@ function Test-PythonHasAiohttp {
     }
 }
 
-function Resolve-CcminiPython {
+function Resolve-HarePython {
     $candidates = @()
 
     if ($env:PYTHON) {
@@ -49,32 +49,32 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
 if (-not (Test-Path ".\package.json")) {
-    throw "package.json not found. Please run this script from frontend-web."
+    throw "package.json not found. Please run this script from hare desktop."
 }
 
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
     throw "npm is not installed or not in PATH."
 }
 
-$pythonExe = Resolve-CcminiPython
+$pythonExe = Resolve-HarePython
 $env:PYTHON = $pythonExe
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-$env:CCMINI_PROVIDER = $Provider
-$env:CCMINI_MODEL = $Model
-$env:CCMINI_BASE_URL = $BaseUrl
+$env:HARE_PROVIDER = $Provider
+$env:HARE_MODEL = $Model
+$env:HARE_BASE_URL = $BaseUrl
 
 if ($ApiKey) {
-    $env:CCMINI_API_KEY = $ApiKey
+    $env:HARE_API_KEY = $ApiKey
 }
 
-Write-Host "Starting ccmini desktop frontend..." -ForegroundColor Cyan
-Write-Host "Provider: $($env:CCMINI_PROVIDER)"
-Write-Host "Model:    $($env:CCMINI_MODEL)"
-Write-Host "Base URL: $($env:CCMINI_BASE_URL)"
+Write-Host "Starting hare desktop frontend..." -ForegroundColor Cyan
+Write-Host "Provider: $($env:HARE_PROVIDER)"
+Write-Host "Model:    $($env:HARE_MODEL)"
+Write-Host "Base URL: $($env:HARE_BASE_URL)"
 Write-Host "Python:   $($env:PYTHON)"
-if ($env:CCMINI_API_KEY) {
+if ($env:HARE_API_KEY) {
     Write-Host "API Key:  [set]"
 } else {
     Write-Host "API Key:  [not set, configure in Settings -> Models or pass -ApiKey]"

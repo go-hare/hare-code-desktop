@@ -6,17 +6,13 @@ const os = require('os');
 const path = require('path');
 const { randomUUID } = require('crypto');
 const { EventEmitter } = require('events');
-const { spawn, spawnSync } = require('child_process');
-const readline = require('readline');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const ENV_PATH = path.join(PROJECT_ROOT, '.env');
 const TITLE_BAR_BASE_HEIGHT = 44;
-const DEBUG_LOG = path.join(os.homedir(), 'AppData', 'Roaming', 'ccmini-desktop', 'main-debug.log');
+const DEBUG_LOG = path.join(os.homedir(), 'AppData', 'Roaming', 'hare-desktop', 'main-debug.log');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_SKILLS_ROOT = path.join(CODEX_HOME, 'skills');
-const HARE_CODE_RELEASE_REPO = 'go-hare/hare-code';
-const HARE_CODE_RELEASE_VERSION = process.env.HARE_CODE_RELEASE_VERSION || '1.0.0';
 
 let mainWindow = null;
 let apiServer = null;
@@ -25,11 +21,8 @@ let currentWorkspace = PROJECT_ROOT;
 let statePath = '';
 let uploadsDir = '';
 let customSkillsDir = '';
-let hareCodeRuntimeDir = '';
 const activeRuns = new Map();
 let state = null;
-let installingHareCodePromise = null;
-let npmGlobalPrefixCache = null;
 
 const readJson = (file, fallback) => {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
@@ -46,281 +39,6 @@ const writeJson = (file, value) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(value, null, 2), 'utf8');
 };
-
-const isWindowsBatch = (command = '') => process.platform === 'win32' && /\.(cmd|bat)$/i.test(String(command));
-const uniqueValues = (values) => [...new Set((values || []).filter(Boolean))];
-const withPrependedPath = (env, entry) => {
-  if (!entry) return env;
-  const delimiter = process.platform === 'win32' ? ';' : ':';
-  return { ...env, PATH: `${entry}${delimiter}${env.PATH || ''}` };
-};
-const expandWindowsEnvVars = (value = '') => String(value).replace(/%([^%]+)%/g, (_match, name) => process.env[name] || `%${name}%`);
-
-function runCommandCapture(command, args = [], options = {}) {
-  return spawnSync(command, args, {
-    encoding: 'utf8',
-    windowsHide: true,
-    shell: isWindowsBatch(command),
-    ...options,
-  });
-}
-
-function spawnCommand(command, args = [], options = {}) {
-  return spawn(command, args, {
-    windowsHide: true,
-    shell: isWindowsBatch(command),
-    ...options,
-  });
-}
-
-function registryPathDirectories() {
-  if (process.platform !== 'win32') return [];
-  const powershellPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const result = runCommandCapture(powershellPath, ['-NoProfile', '-Command', "[Environment]::GetEnvironmentVariable('Path','User'); [Environment]::GetEnvironmentVariable('Path','Machine')"]);
-  if (result.status !== 0) return [];
-  return uniqueValues(
-    String(result.stdout || '')
-      .split(/\r?\n/)
-      .flatMap((line) => line.split(';'))
-      .map((item) => expandWindowsEnvVars(item.trim()))
-      .filter(Boolean),
-  );
-}
-
-function windowsPathDirectories() {
-  if (process.platform !== 'win32') return [];
-  return uniqueValues(
-    [...String(process.env.PATH || '').split(';'), ...registryPathDirectories()]
-      .map((item) => expandWindowsEnvVars(String(item).trim()))
-      .filter(Boolean),
-  );
-}
-
-function findCommandsInDirectories(names, directories) {
-  const results = [];
-  directories.forEach((dir) => {
-    names.forEach((name) => {
-      const candidate = path.join(dir, name);
-      if (fs.existsSync(candidate)) {
-        results.push(candidate);
-      }
-    });
-  });
-  return uniqueValues(results);
-}
-
-function findCommandsOnPath(command) {
-  const locator = process.platform === 'win32' ? 'where.exe' : 'which';
-  const result = runCommandCapture(locator, [command]);
-  if (result.status !== 0) return [];
-  return uniqueValues(String(result.stdout || '').split(/\r?\n/).map((item) => item.trim()).filter(Boolean));
-}
-
-function canRunCommand(command, args = ['--version']) {
-  if (!command) return false;
-  if (path.isAbsolute(command) && !fs.existsSync(command)) return false;
-  const result = runCommandCapture(command, args, { cwd: currentWorkspace || PROJECT_ROOT });
-  return result.status === 0;
-}
-
-function preferWindowsExecutables(candidates = []) {
-  return [...candidates].sort((left, right) => {
-    const score = (value) => {
-      const normalized = String(value || '').toLowerCase();
-      if (normalized.endsWith('.exe')) return 0;
-      if (normalized.endsWith('.cmd')) return 1;
-      if (normalized.endsWith('.bat')) return 2;
-      return 3;
-    };
-    return score(left) - score(right);
-  });
-}
-
-function existingCommand(candidates = []) {
-  const ordered = process.platform === 'win32' ? preferWindowsExecutables(uniqueValues(candidates)) : uniqueValues(candidates);
-  return ordered.find((item) => {
-    if (!item) return false;
-    if (path.isAbsolute(item)) return fs.existsSync(item);
-    return true;
-  }) || null;
-}
-
-function detectBunBinary() {
-  const candidates = uniqueValues([
-    process.env.BUN_BINARY,
-    ...findCommandsOnPath('bun'),
-    ...findCommandsOnPath('bun.exe'),
-    ...findCommandsInDirectories(['bun.exe', 'bun.cmd'], windowsPathDirectories()),
-    path.join(os.homedir(), '.bun', 'bin', 'bun.exe'),
-  ]);
-  const command = existingCommand(candidates);
-  return { found: Boolean(command), path: command };
-}
-
-function detectNpmGlobalPrefix(npmPath) {
-  if (!npmPath) return null;
-  if (npmGlobalPrefixCache?.npmPath === npmPath) return npmGlobalPrefixCache.prefix;
-  const result = runCommandCapture(npmPath, ['prefix', '-g']);
-  const prefix = result.status === 0 ? String(result.stdout || '').trim() || null : null;
-  npmGlobalPrefixCache = { npmPath, prefix };
-  return prefix;
-}
-
-function detectNpmBinary() {
-  const candidates = uniqueValues([
-    ...findCommandsOnPath('npm.cmd'),
-    ...findCommandsOnPath('npm.exe'),
-    ...findCommandsOnPath('npm'),
-    ...findCommandsInDirectories(['npm.cmd', 'npm.exe'], windowsPathDirectories()),
-    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'npm.cmd'),
-    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'nodejs', 'npm.cmd'),
-  ]);
-  const command = existingCommand(candidates);
-  return { found: Boolean(command), path: command };
-}
-
-function getHareCodeBinaryAssetName() {
-  if (process.platform === 'win32' && process.arch === 'x64') return 'hare-code-windows-x64.exe';
-  if (process.platform === 'linux' && process.arch === 'x64') return 'hare-code-linux-x64-baseline';
-  if (process.platform === 'linux' && process.arch === 'arm64') return 'hare-code-linux-arm64';
-  if (process.platform === 'darwin' && process.arch === 'x64') return 'hare-code-darwin-x64';
-  if (process.platform === 'darwin' && process.arch === 'arm64') return 'hare-code-darwin-arm64';
-  return null;
-}
-
-function getHareCodeReleaseBinaryUrl() {
-  const assetName = getHareCodeBinaryAssetName();
-  if (!assetName) return null;
-  return `https://github.com/${HARE_CODE_RELEASE_REPO}/releases/download/v${HARE_CODE_RELEASE_VERSION}/${assetName}`;
-}
-
-function managedHareCodeCandidates() {
-  const assetName = getHareCodeBinaryAssetName();
-  if (!hareCodeRuntimeDir || !assetName) return [];
-  return [path.join(hareCodeRuntimeDir, assetName)];
-}
-
-function readFilePreview(filePath, maxBytes = 4096) {
-  try {
-    const fd = fs.openSync(filePath, 'r');
-    try {
-      const buffer = Buffer.alloc(maxBytes);
-      const size = fs.readSync(fd, buffer, 0, maxBytes, 0);
-      return buffer.toString('utf8', 0, size);
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return '';
-  }
-}
-
-function commandNeedsBunRuntime(command) {
-  if (!command) return false;
-  const normalized = String(command).toLowerCase();
-  if (/\.(cmd|bat|ps1)$/i.test(normalized)) {
-    return true;
-  }
-  if (!path.isAbsolute(command)) {
-    return false;
-  }
-  try {
-    const resolvedPath = fs.realpathSync(command);
-    const preview = readFilePreview(resolvedPath);
-    if (!preview) return false;
-    return preview.includes('/usr/bin/env bun')
-      || preview.includes('spawn(bunBinary')
-      || preview.includes('hare-code 需要 Bun 运行时');
-  } catch {
-    return false;
-  }
-}
-
-function detectHareCodeBinary() {
-  const roamingNpmDir = path.join(os.homedir(), 'AppData', 'Roaming', 'npm');
-  const npm = detectNpmBinary();
-  const npmPrefix = detectNpmGlobalPrefix(npm.path);
-  const npmGlobalCandidates = npmPrefix
-    ? (process.platform === 'win32'
-      ? [
-          path.join(npmPrefix, 'hare-code.cmd'),
-          path.join(npmPrefix, 'hare-code.exe'),
-        ]
-      : [path.join(npmPrefix, 'bin', 'hare-code')])
-    : [];
-  const candidates = uniqueValues([
-    process.env.HARE_CODE_BIN,
-    ...managedHareCodeCandidates(),
-    path.join(roamingNpmDir, 'hare-code.cmd'),
-    path.join(roamingNpmDir, 'hare-code.exe'),
-    path.join(roamingNpmDir, 'hare-code'),
-    ...findCommandsOnPath('hare-code'),
-    ...findCommandsOnPath('hare-code.exe'),
-    ...findCommandsOnPath('hare-code.cmd'),
-    ...npmGlobalCandidates,
-  ]);
-  const command = existingCommand(candidates);
-  return {
-    found: Boolean(command),
-    path: command,
-    managed: Boolean(command && (
-      (hareCodeRuntimeDir && command.startsWith(hareCodeRuntimeDir))
-      || (npmPrefix && command.startsWith(npmPrefix))
-    )),
-  };
-}
-
-function systemStatusPayload() {
-  const hareCode = detectHareCodeBinary();
-  const bun = detectBunBinary();
-  const hareCodeNeedsBun = commandNeedsBunRuntime(hareCode.path);
-  return {
-    platform: process.platform,
-    bun: {
-      required: hareCodeNeedsBun,
-      found: bun.found,
-      path: bun.path,
-    },
-    hareCode: {
-      required: true,
-      found: hareCode.found,
-      path: hareCode.path,
-      managed: hareCode.managed,
-      install_url: getHareCodeReleaseBinaryUrl(),
-    },
-  };
-}
-
-async function installManagedHareCode() {
-  if (installingHareCodePromise) return installingHareCodePromise;
-  installingHareCodePromise = (async () => {
-    const downloadUrl = getHareCodeReleaseBinaryUrl();
-    const assetName = getHareCodeBinaryAssetName();
-    if (!downloadUrl || !assetName) {
-      throw new Error(`当前平台暂不支持自动安装 hare-code 二进制：${process.platform}/${process.arch}`);
-    }
-    ensureDir(hareCodeRuntimeDir);
-    const targetPath = path.join(hareCodeRuntimeDir, assetName);
-    const response = await fetch(downloadUrl);
-    if (!response.ok) {
-      throw new Error(`下载 hare-code 二进制失败：HTTP ${response.status}`);
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    fs.writeFileSync(targetPath, buffer);
-    if (process.platform !== 'win32') {
-      fs.chmodSync(targetPath, 0o755);
-    }
-
-    const hareCode = detectHareCodeBinary();
-    if (!hareCode.found) {
-      throw new Error('hare-code 安装完成，但未检测到可执行命令。');
-    }
-    return hareCode;
-  })().finally(() => {
-    installingHareCodePromise = null;
-  });
-  return installingHareCodePromise;
-}
 
 const nowIso = () => new Date().toISOString();
 const stripThinking = (model = '') => `${model}`.replace(/-thinking$/, '');
@@ -814,7 +532,7 @@ function skillFilePath(record, requestedPath = '') {
 
 function githubHeaders(extra = {}) {
   return {
-    'User-Agent': 'ccmini-desktop',
+      'User-Agent': 'hare-desktop',
     'Accept': 'application/vnd.github+json',
     ...extra,
   };
@@ -980,11 +698,49 @@ function resolveProvider(conversation, body = {}) {
   return fallback ? { ...fallback, model: modelId || fallback.models?.[0]?.id } : null;
 }
 
-function buildCliArgs(sessionId, model, started) {
-  const args = ['-p', '--output-format', 'stream-json', '--include-partial-messages', '--verbose'];
-  if (started) args.push('--resume', sessionId); else args.push('--session-id', sessionId);
-  if (model) args.push('--model', model);
-  return args;
+function sdkSessionFingerprint(provider, workspacePath) {
+  return JSON.stringify({
+    workspacePath: workspacePath || currentWorkspace || PROJECT_ROOT,
+    baseUrl: provider?.baseUrl || '',
+    apiKey: provider?.apiKey || '',
+    model: provider?.model || '',
+    format: provider?.format || '',
+  });
+}
+
+function loadHareSdkModule() {
+  if (!global.__hareSdkModulePromise) {
+    global.__hareSdkModulePromise = import('./vendor/hare-code-sdk.js');
+  }
+  return global.__hareSdkModulePromise;
+}
+
+async function getOrCreateDesktopSdkSession({ conversation, provider, workspacePath }) {
+  const key = conversation.id;
+  const fingerprint = sdkSessionFingerprint(provider, workspacePath);
+  const existing = activeRuns.get(`sdk-session:${key}`);
+  if (existing && existing.fingerprint === fingerprint) {
+    return existing.session;
+  }
+
+  if (existing?.session?.close) {
+    await existing.session.close().catch(() => {});
+  }
+
+  const sdk = await loadHareSdkModule();
+  const session = sdk.createHeadlessChatSession({
+    cwd: workspacePath || currentWorkspace || PROJECT_ROOT,
+    sessionId: conversation.backend_session_id || randomUUID(),
+    provider: {
+      baseUrl: provider.baseUrl || '',
+      apiKey: provider.apiKey || '',
+      model: provider.model || conversation.model,
+    },
+    includePartialMessages: true,
+  });
+
+  activeRuns.set(`sdk-session:${key}`, { fingerprint, session });
+  return session;
 }
 
 function extractAssistantText(message) {
@@ -1023,45 +779,50 @@ function runViaOpenAI({ provider, prompt, onText, onDone, onError, onStart }) {
   }).catch((error) => onError(error?.name === 'AbortError' ? 'Task stopped.' : (error?.message || 'OpenAI request failed')));
 }
 
-function runViaCli({ conversation, provider, prompt, workspacePath, onText, onDone, onError, onStart }) {
-  const hareCode = detectHareCodeBinary();
-  if (!hareCode.found || !hareCode.path) {
-    onError('未检测到 hare-code 命令，请先在桌面端完成安装。');
-    return;
-  }
-  const sessionId = conversation.backend_session_id || randomUUID();
-  const bun = detectBunBinary();
-  if (commandNeedsBunRuntime(hareCode.path) && (!bun.found || !bun.path)) {
-    onError('当前 hare-code 仍依赖 Bun 运行时，请先安装 Bun，或改用 GitHub Release 二进制。');
-    return;
-  }
-  let env = { ...process.env, ANTHROPIC_BASE_URL: provider.baseUrl || '', ANTHROPIC_API_KEY: provider.apiKey || '', ANTHROPIC_AUTH_TOKEN: provider.apiKey || '' };
-  if (bun.found && bun.path) {
-    env = withPrependedPath(env, path.dirname(bun.path));
-  }
-  const child = spawnCommand(hareCode.path, buildCliArgs(sessionId, provider.model || conversation.model, Boolean(conversation.backend_started)), { cwd: workspacePath || currentWorkspace || PROJECT_ROOT, stdio: ['pipe', 'pipe', 'pipe'], env });
-  let assistant = '', stderr = '';
-  onStart({ stop: () => child.kill(), sessionId });
-  child.stdin.write(prompt);
-  child.stdin.end();
-  readline.createInterface({ input: child.stdout }).on('line', (line) => {
-    try {
-      const parsed = JSON.parse(line.trim());
-      const delta = parsed?.event?.delta?.text;
-      if (parsed?.type === 'stream_event' && parsed?.event?.type === 'content_block_delta' && delta) onText(delta);
-      if (parsed?.type === 'assistant') assistant = extractAssistantText(parsed.message) || assistant;
-      if (parsed?.type === 'result' && typeof parsed.result === 'string') assistant = parsed.result || assistant;
-    } catch {}
-  });
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-  child.on('error', (error) => {
-    onError(error?.message || 'hare-code 启动失败');
-  });
-  child.on('close', (code) => {
+async function runViaSdk({ conversation, provider, prompt, workspacePath, onText, onDone, onError, onStart }) {
+  try {
+    const session = await getOrCreateDesktopSdkSession({ conversation, provider, workspacePath });
+    const sessionId = session.getSessionId();
+    let assistant = '';
+    onStart({
+      stop: () => session.abort(),
+      sessionId,
+    });
+
+    for await (const message of session.stream(prompt)) {
+      const delta = message?.type === 'stream_event'
+        && message?.event?.type === 'content_block_delta'
+        ? message?.event?.delta?.text
+        : '';
+      if (delta) {
+        assistant += delta;
+        onText(delta);
+      }
+      if (message?.type === 'assistant') {
+        assistant = extractAssistantText(message.message) || assistant;
+      }
+      if (message?.type === 'result') {
+        conversation.backend_session_id = sessionId;
+        if (typeof message.result === 'string') {
+          assistant = message.result || assistant;
+        }
+        conversation.backend_started = !message.is_error;
+        if (message.is_error) {
+          onError((Array.isArray(message.errors) ? message.errors.join('\n') : '') || assistant || 'SDK request failed');
+        } else {
+          onDone(assistant.trim());
+        }
+        return;
+      }
+    }
+
     conversation.backend_session_id = sessionId;
-    conversation.backend_started = code === 0;
-    code === 0 ? onDone(assistant.trim()) : onError((stderr || assistant || 'CLI request failed').trim());
-  });
+    conversation.backend_started = true;
+    onDone(assistant.trim());
+  } catch (error) {
+    conversation.backend_started = false;
+    onError(error?.message || 'hare-code SDK request failed');
+  }
 }
 
 function createWindow() {
@@ -1097,15 +858,6 @@ function startApiServer() {
     api.use(express.json({ limit: '20mb' }));
     api.use('/api/uploads', express.static(uploadsDir));
 
-  api.get('/api/system-status', (_req, res) => res.json(systemStatusPayload()));
-  api.post('/api/system/install-hare-code', async (_req, res) => {
-    try {
-      const hareCode = await installManagedHareCode();
-      res.json({ ok: true, path: hareCode.path || null });
-    } catch (error) {
-      res.status(500).json({ error: error?.message || 'Failed to install hare-code' });
-    }
-  });
   api.route('/api/workspace-config').get((_req, res) => res.json({ defaultDir: currentWorkspace })).post((req, res) => { currentWorkspace = req.body?.dir || currentWorkspace; saveState(); res.json({ ok: true, defaultDir: currentWorkspace }); });
   api.post('/api/auth/send-code', (_req, res) => res.json({ ok: true, message: '验证码已发送（本地占位）' }));
   api.post('/api/auth/register', (req, res) => {
@@ -1731,7 +1483,17 @@ function startApiServer() {
   api.post('/api/conversations', (req, res) => { const conversation = { id: `conv-${randomUUID()}`, title: req.body?.title || 'New Chat', model: req.body?.model || state.chatModels?.[0]?.id || 'claude-sonnet-4-6', workspace_path: req.body?.workspace_path || currentWorkspace, project_id: null, messages: [], created_at: nowIso(), updated_at: nowIso() }; state.conversations.unshift(conversation); saveState(); res.json(conversationView(conversation)); });
   api.get('/api/conversations/:id', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); conversation ? res.json(conversationView(conversation)) : res.status(404).json({ error: 'Conversation not found' }); });
   api.patch('/api/conversations/:id', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); if (!conversation) return res.status(404).json({ error: 'Conversation not found' }); Object.assign(conversation, req.body || {}, { updated_at: nowIso() }); saveState(); res.json(conversationView(conversation)); });
-  api.delete('/api/conversations/:id', (req, res) => { state.conversations = state.conversations.filter((item) => item.id !== req.params.id); state.projects.forEach((project) => { project.conversations = (project.conversations || []).filter((id) => id !== req.params.id); }); saveState(); res.json({ ok: true }); });
+  api.delete('/api/conversations/:id', async (req, res) => {
+    const sdkRun = activeRuns.get(`sdk-session:${req.params.id}`);
+    if (sdkRun?.session?.close) {
+      await sdkRun.session.close().catch(() => {});
+    }
+    activeRuns.delete(`sdk-session:${req.params.id}`);
+    state.conversations = state.conversations.filter((item) => item.id !== req.params.id);
+    state.projects.forEach((project) => { project.conversations = (project.conversations || []).filter((id) => id !== req.params.id); });
+    saveState();
+    res.json({ ok: true });
+  });
   api.delete('/api/conversations/:id/messages/:messageId', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); if (!conversation) return res.status(404).json({ error: 'Conversation not found' }); const index = (conversation.messages || []).findIndex((item) => item.id === req.params.messageId); if (index >= 0) conversation.messages = conversation.messages.slice(0, index); conversation.updated_at = nowIso(); saveState(); res.json(conversationView(conversation)); });
   api.delete('/api/conversations/:id/messages-tail/:count', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); if (!conversation) return res.status(404).json({ error: 'Conversation not found' }); conversation.messages = conversation.messages.slice(0, Math.max(0, conversation.messages.length - Number(req.params.count || 0))); conversation.updated_at = nowIso(); saveState(); res.json(conversationView(conversation)); });
   api.get('/api/conversations/:id/generation-status', (req, res) => res.json({ active: activeRuns.has(req.params.id), status: activeRuns.has(req.params.id) ? 'generating' : 'idle', crossProcess: false }));
@@ -1794,7 +1556,9 @@ function startApiServer() {
     const onDone = (fullText) => { conversation.messages.push({ id: `msg-${randomUUID()}`, role: 'assistant', content: fullText || run.fullText || '[模型未返回文本]', created_at: nowIso(), attachments: [] }); conversation.updated_at = nowIso(); saveState(); write({ type: 'message_stop' }); write('[DONE]'); res.end(); activeRuns.delete(conversation.id); };
     const onError = (error) => { write({ type: 'error', error: error || 'Request failed' }); write('[DONE]'); res.end(); activeRuns.delete(conversation.id); };
     const onStart = (controller) => { run.stop = controller.stop; if (controller.sessionId) conversation.backend_session_id = controller.sessionId; };
-    provider.format === 'openai' ? runViaOpenAI({ provider, prompt: req.body.message || '', onText, onDone, onError, onStart }) : runViaCli({ conversation, provider, prompt: req.body.message || '', workspacePath: conversation.workspace_path || currentWorkspace, onText, onDone, onError, onStart });
+    provider.format === 'openai'
+      ? runViaOpenAI({ provider, prompt: req.body.message || '', onText, onDone, onError, onStart })
+      : void runViaSdk({ conversation, provider, prompt: req.body.message || '', workspacePath: conversation.workspace_path || currentWorkspace, onText, onDone, onError, onStart });
     req.on('aborted', () => {
       if (!res.writableEnded) activeRuns.get(conversation.id)?.stop();
     });
@@ -1819,17 +1583,16 @@ function startApiServer() {
 
 app.whenReady().then(async () => {
   debugLog('app.whenReady entered');
-  statePath = path.join(app.getPath('userData'), 'ccmini-state.json');
+  statePath = path.join(app.getPath('userData'), 'hare-state.json');
   uploadsDir = path.join(app.getPath('userData'), 'uploads');
   customSkillsDir = path.join(app.getPath('userData'), 'skills');
-  hareCodeRuntimeDir = path.join(app.getPath('userData'), 'hare-code-runtime');
   state = loadState();
   syncChatModelsFromProviders();
   apiBase = await startApiServer();
   state.apiBase = apiBase;
   saveState();
   debugLog(`state saved with apiBase ${apiBase}`);
-  process.env.CCMINI_API_BASE = apiBase;
+  process.env.HARE_API_BASE = apiBase;
   createWindow();
   debugLog('window created');
 });

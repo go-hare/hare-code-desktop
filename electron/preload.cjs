@@ -2,7 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 // Expose safe APIs to the renderer process 
 contextBridge.exposeInMainWorld('electronAPI', {
-    apiBase: process.env.CCMINI_API_BASE || '',
+    apiBase: process.env.HARE_API_BASE || '',
     // Zoom change listener
     onZoomChanged: (callback) => ipcRenderer.on('zoom-changed', (_, factor) => callback(factor)),
     // Platform info
