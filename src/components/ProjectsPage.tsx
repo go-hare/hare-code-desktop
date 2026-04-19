@@ -75,7 +75,7 @@ const ProjectsPage = () => {
   const handleChatSubmit = async () => {
     if (!message.trim() || !currentProject) return;
     try {
-      const conv = await createProjectConversation(currentProject.id, message.slice(0, 50), currentModelString);
+      const conv = await createProjectConversation(currentProject.id, message.slice(0, 50), currentModelString, 'chat');
       navigate(`/chat/${conv.id}`, { state: { initialMessage: message, model: currentModelString } });
       setMessage('');
     } catch (err) {
@@ -200,7 +200,7 @@ const ProjectsPage = () => {
   const handleNewChat = async () => {
     if (!currentProject) return;
     try {
-      const conv = await createProjectConversation(currentProject.id);
+      const conv = await createProjectConversation(currentProject.id, undefined, undefined, 'chat');
       navigate(`/chat/${conv.id}`);
     } catch (_) { }
   };

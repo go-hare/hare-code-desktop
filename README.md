@@ -27,7 +27,7 @@ bun run sdk:build
 bun run build
 ```
 
-`bun run sdk:build` 会先在 `../hare-code` 执行 SDK build，再把生成的 `dist/sdk.js` 同步到 `electron/vendor/hare-code-sdk.js`，Electron 主进程运行时直接动态导入这份本地 bundle。
+`bun run sdk:build` 会先在 `../hare-code` 执行 build，再把生成的 `dist/code.js` 同步到 `electron/vendor/hare-code-sdk.js`，Electron 主进程运行时直接动态导入这份本地 bundle。
 
 ## 独立发布 / 独立仓库模式
 
@@ -37,7 +37,7 @@ bun run build
 bun run sdk:build:package
 ```
 
-默认会按当前桌面端版本优先查找 sibling 目录里的 `hare-code-<version>.tgz`；如果当前工作区存在 sibling `../hare-code`，脚本会先重新 build 并刷新这个本地 tgz，再从打包产物里抽出 `dist/sdk.js` 到 `electron/vendor/hare-code-sdk.js`。如果本地没有该 tarball，则会自动从 GitHub Release 下载 `hare-code-<version>.tgz`。
+默认会按当前桌面端版本优先查找 sibling 目录里的 `hare-code-<version>.tgz`；如果当前工作区存在 sibling `../hare-code`，脚本会先重新 build 并刷新这个本地 tgz，再从打包产物里抽出 `dist/code.js` 到 `electron/vendor/hare-code-sdk.js`。如果本地没有该 tarball，则会自动从 GitHub Release 下载 `hare-code-<version>.tgz`。
 
 如需指定发布仓库，可设置：
 

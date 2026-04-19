@@ -304,11 +304,11 @@ const getWorkspaceName = (workspacePath: string) => {
       window.removeEventListener('conversationTitleUpdated', handleTitleUpdate);
       window.removeEventListener('userProfileUpdated', handleProfileUpdate);
     };
-  }, [refreshTrigger]);
+  }, [refreshTrigger, isCoworkMode]);
 
   const fetchChats = async () => {
     try {
-      const data = await getConversations();
+      const data = await getConversations(isCoworkMode ? 'cowork' : 'chat');
       console.log('[Sidebar] Fetched conversations:', data);
       if (Array.isArray(data)) {
         setChats(data);
@@ -360,7 +360,7 @@ const getWorkspaceName = (workspacePath: string) => {
       await updateConversation(renameChatId, { title: newTitle });
 
       // Notify other components (like Header) about the title change if it's the active chat
-      if (location.pathname === `/chat/${renameChatId}`) {
+      if (location.pathname === `/chat/${renameChatId}` || location.pathname === `/cowork/${renameChatId}`) {
         window.dispatchEvent(new CustomEvent('conversationTitleUpdated'));
       }
     } catch (err) {
@@ -380,6 +380,8 @@ const getWorkspaceName = (workspacePath: string) => {
       setActiveMenuIndex(null);
       if (location.pathname === `/chat/${id}`) {
         navigate('/');
+      } else if (location.pathname === `/cowork/${id}`) {
+        navigate('/cowork');
       }
     } catch (err) {
       console.error(err);

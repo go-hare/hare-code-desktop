@@ -279,7 +279,6 @@ const ChatHeader = ({
 };
 
 const Layout = () => {
-  const { id: routeConversationId } = useParams();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [newChatKey, setNewChatKey] = useState(0);
@@ -403,6 +402,9 @@ const Layout = () => {
   }, [rememberCoworkWorkspace]);
 
   const handleTopModeChange = useCallback(async (mode: TopModeKey) => {
+    if (mode === activeTopMode) {
+      return;
+    }
     if (mode === 'code') {
       return;
     }
@@ -414,24 +416,15 @@ const Layout = () => {
       if (workspacePath) {
         rememberCoworkWorkspace(workspacePath);
       }
-      if (routeConversationId && workspacePath) {
-        try {
-          await updateConversation(routeConversationId, { workspace_path: workspacePath });
-        } catch (err) {
-          console.error('Failed to attach conversation to cowork workspace:', err);
-        }
-        navigate(`/cowork/${routeConversationId}`);
-      } else if (location.pathname !== '/cowork') {
+      if (location.pathname !== '/cowork') {
         navigate('/cowork');
       }
       return;
     }
-    if (routeConversationId) {
-      navigate(`/chat/${routeConversationId}`);
-    } else if (location.pathname !== '/') {
+    if (location.pathname !== '/') {
       navigate('/');
     }
-  }, [activeCoworkWorkspacePath, location.pathname, navigate, rememberCoworkWorkspace, routeConversationId]);
+  }, [activeCoworkWorkspacePath, activeTopMode, location.pathname, navigate, rememberCoworkWorkspace]);
 
   // Navigation history for back/forward buttons
   const [navHistory, setNavHistory] = useState<string[]>([location.pathname + location.search + location.hash]);

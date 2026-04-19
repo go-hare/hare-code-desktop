@@ -402,6 +402,8 @@ export interface ProjectFile {
   created_at: string;
 }
 
+export type SessionKind = 'chat' | 'cowork';
+
 export async function getProjects(): Promise<Project[]> {
   const res = await request('/projects');
   return res.json();
@@ -451,22 +453,22 @@ export async function deleteProjectFile(projectId: string, fileId: string) {
   return res.json();
 }
 
-export async function getProjectConversations(projectId: string) {
-  const res = await request(`/projects/${projectId}/conversations`);
+export async function getProjectConversations(projectId: string, sessionKind: SessionKind = 'chat') {
+  const res = await request(`/projects/${projectId}/conversations?session_kind=${encodeURIComponent(sessionKind)}`);
   return res.json();
 }
 
-export async function createProjectConversation(projectId: string, title?: string, model?: string) {
+export async function createProjectConversation(projectId: string, title?: string, model?: string, sessionKind: SessionKind = 'chat') {
   const res = await request(`/projects/${projectId}/conversations`, {
     method: 'POST',
-    body: JSON.stringify({ title, model }),
+    body: JSON.stringify({ title, model, session_kind: sessionKind }),
   });
   return res.json();
 }
 
 // 对话相关
-export async function getConversations() {
-  const res = await request('/conversations');
+export async function getConversations(sessionKind: SessionKind = 'chat') {
+  const res = await request(`/conversations?session_kind=${encodeURIComponent(sessionKind)}`);
   return res.json();
 }
 
@@ -483,7 +485,7 @@ export async function getArtifactContent(filePath: string) {
 export async function createConversation(
   title?: string,
   model?: string,
-  extras?: { research_mode?: boolean; workspace_path?: string },
+  extras?: { research_mode?: boolean; workspace_path?: string; session_kind?: SessionKind },
 ) {
   const body: any = { model };
   if (title !== undefined) {
@@ -494,6 +496,9 @@ export async function createConversation(
   }
   if (extras?.workspace_path) {
     body.workspace_path = extras.workspace_path;
+  }
+  if (extras?.session_kind) {
+    body.session_kind = extras.session_kind;
   }
   const res = await request('/conversations', {
     method: 'POST',

@@ -116,7 +116,7 @@ const ChatsPage = () => {
 
   const fetchChats = async () => {
     try {
-      const data = await getConversations();
+      const data = await getConversations('chat');
       if (Array.isArray(data)) {
         setChats(data);
       }

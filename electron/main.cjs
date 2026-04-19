@@ -5,10 +5,17 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { randomUUID } = require('crypto');
+const { spawn } = require('child_process');
 const { EventEmitter } = require('events');
+const readline = require('readline');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
-const ENV_PATH = path.join(PROJECT_ROOT, '.env');
+const HARE_CODE_ROOT = (() => {
+  const nestedRoot = path.join(PROJECT_ROOT, 'hare-code');
+  if (fs.existsSync(path.join(nestedRoot, 'package.json'))) return nestedRoot;
+  return PROJECT_ROOT;
+})();
+const ENV_PATH = path.join(HARE_CODE_ROOT, '.env');
 const TITLE_BAR_BASE_HEIGHT = 44;
 const DEBUG_LOG = path.join(os.homedir(), 'AppData', 'Roaming', 'hare-desktop', 'main-debug.log');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -43,7 +50,89 @@ const writeJson = (file, value) => {
 const nowIso = () => new Date().toISOString();
 const stripThinking = (model = '') => `${model}`.replace(/-thinking$/, '');
 const roughTokens = (text = '') => Math.max(1, Math.round(`${text}`.length / 4));
+const truncateText = (text = '', maxLength = 2000) =>
+  `${text}`.length > maxLength ? `${`${text}`.slice(0, maxLength)}\n...[truncated]` : `${text}`;
 const inferFormat = (baseUrl = '', model = '') => (/gpt|glm|deepseek|qwen|gemini/i.test(model) || /openai|compatible|v1/i.test(baseUrl)) ? 'openai' : 'anthropic';
+const normalizeSessionKind = (value) => String(value || '').trim() === 'cowork' ? 'cowork' : 'chat';
+
+function resolveCoworkCliEntry() {
+  const envEntry = String(process.env.HARE_DESKTOP_CLI_ENTRY || '').trim();
+  if (envEntry) return envEntry;
+
+  const distEntry = path.join(HARE_CODE_ROOT, 'dist', 'entrypoints', 'cli.js');
+  if (fs.existsSync(distEntry)) return distEntry;
+
+  const sourceEntry = path.join(HARE_CODE_ROOT, 'src', 'entrypoints', 'cli.tsx');
+  if (fs.existsSync(sourceEntry)) return sourceEntry;
+
+  throw new Error(`Unable to resolve hare-code CLI entry under ${HARE_CODE_ROOT}`);
+}
+
+function isCliSessionInUseError(errorText) {
+  return /Session ID .* is already in use/i.test(String(errorText || ''));
+}
+
+function buildCoworkCliArgs({ sessionId, model, isResuming }) {
+  const args = [
+    resolveCoworkCliEntry(),
+    '-p',
+    '--output-format',
+    'stream-json',
+    '--include-partial-messages',
+    '--verbose',
+    '--dangerously-skip-permissions',
+  ];
+
+  if (isResuming) {
+    args.push('--resume', sessionId);
+  } else {
+    args.push('--session-id', sessionId);
+  }
+
+  if (model && String(model).trim()) {
+    args.push('--model', String(model).trim());
+  }
+
+  return args;
+}
+
+function buildCoworkCliEnv(provider) {
+  const model = String(provider?.model || '').trim();
+  const baseUrl = String(provider?.baseUrl || '').trim();
+  const apiKey = String(provider?.apiKey || '').trim();
+  const format = provider?.format || inferFormat(baseUrl, model);
+
+  const baseEnv = {
+    ...process.env,
+    CLAUDE_CODE_IS_COWORK: '1',
+    CLAUDE_CODE_USE_OPENAI_COMPAT: '',
+    OPENAI_COMPAT_BASE_URL: '',
+    OPENAI_COMPAT_API_KEY: '',
+    OPENAI_COMPAT_MODEL: '',
+    ANTHROPIC_BASE_URL: '',
+    ANTHROPIC_API_KEY: '',
+    ANTHROPIC_AUTH_TOKEN: '',
+    ANTHROPIC_MODEL: '',
+  };
+
+  if (format === 'openai') {
+    return {
+      ...baseEnv,
+      CLAUDE_CODE_USE_OPENAI_COMPAT: '1',
+      OPENAI_COMPAT_BASE_URL: baseUrl,
+      OPENAI_COMPAT_API_KEY: apiKey,
+      OPENAI_COMPAT_MODEL: model,
+    };
+  }
+
+  return {
+    ...baseEnv,
+    ANTHROPIC_BASE_URL: baseUrl,
+    ANTHROPIC_API_KEY: apiKey,
+    ANTHROPIC_AUTH_TOKEN: apiKey,
+    ANTHROPIC_MODEL: model,
+  };
+}
 
 function readEnvSettings() {
   const data = {};
@@ -212,7 +301,12 @@ function loadState() {
   next.user = { ...defaultUser(), ...(next.user || {}) };
   next.providers = Array.isArray(next.providers) ? next.providers : [];
   next.projects = Array.isArray(next.projects) ? next.projects : [];
-  next.conversations = Array.isArray(next.conversations) ? next.conversations : [];
+  next.conversations = Array.isArray(next.conversations)
+    ? next.conversations.map((conversation) => ({
+        ...conversation,
+        session_kind: normalizeSessionKind(conversation?.session_kind),
+      }))
+    : [];
   next.uploads = Array.isArray(next.uploads) ? next.uploads : [];
   next.skills = Array.isArray(next.skills) ? next.skills : [];
   next.announcements = Array.isArray(next.announcements) ? next.announcements : [];
@@ -643,6 +737,7 @@ function conversationView(conversation) {
     id: conversation.id,
     title: conversation.title,
     model: conversation.model,
+    session_kind: normalizeSessionKind(conversation.session_kind),
     workspace_path: conversation.workspace_path || '',
     project_id: conversation.project_id || null,
     created_at: conversation.created_at,
@@ -728,10 +823,15 @@ async function getOrCreateDesktopSdkSession({ conversation, provider, workspaceP
   }
 
   const sdk = await loadHareSdkModule();
+  const providerKind = provider?.kind
+    || (inferFormat(provider?.baseUrl, provider?.model) === 'openai'
+      ? 'openai_compat'
+      : 'anthropic');
   const session = sdk.createHeadlessChatSession({
     cwd: workspacePath || currentWorkspace || PROJECT_ROOT,
     sessionId: conversation.backend_session_id || randomUUID(),
     provider: {
+      kind: providerKind,
       baseUrl: provider.baseUrl || '',
       apiKey: provider.apiKey || '',
       model: provider.model || conversation.model,
@@ -823,6 +923,147 @@ async function runViaSdk({ conversation, provider, prompt, workspacePath, onText
     conversation.backend_started = false;
     onError(error?.message || 'hare-code SDK request failed');
   }
+}
+
+function runViaCli({ conversation, provider, prompt, workspacePath, onText, onDone, onError, onStart }) {
+  const previousSessionId =
+    conversation.backend_runtime === 'cli' && conversation.backend_session_id
+      ? conversation.backend_session_id
+      : null;
+  const nextSessionId = previousSessionId || randomUUID();
+  const cliEnv = buildCoworkCliEnv(provider);
+  const args = buildCoworkCliArgs({
+    sessionId: nextSessionId,
+    model: provider?.model || conversation.model,
+    isResuming: Boolean(previousSessionId),
+  });
+
+  const spawnRun = ({ sessionId, isResuming }) => new Promise((resolve) => {
+    const bunBinary = process.env.BUN_BINARY || (process.platform === 'win32' ? 'bun.exe' : 'bun');
+    const child = spawn(bunBinary, buildCoworkCliArgs({
+      sessionId,
+      model: provider?.model || conversation.model,
+      isResuming,
+    }), {
+      cwd: workspacePath || currentWorkspace || PROJECT_ROOT,
+      env: cliEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+
+    let stderrLog = '';
+    let stdoutLog = '';
+    let lastAssistantText = '';
+    let lastResultText = '';
+    let resolvedSessionId = sessionId;
+
+    const rl = readline.createInterface({ input: child.stdout });
+    rl.on('line', (line) => {
+      const trimmed = String(line || '').trim();
+      if (!trimmed) return;
+      stdoutLog += `${trimmed}\n`;
+
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        return;
+      }
+
+      if (typeof parsed?.session_id === 'string' && parsed.session_id) {
+        resolvedSessionId = parsed.session_id;
+      }
+
+      if (
+        parsed?.type === 'stream_event'
+        && parsed?.event?.type === 'content_block_delta'
+        && parsed?.event?.delta?.type === 'text_delta'
+        && typeof parsed?.event?.delta?.text === 'string'
+      ) {
+        onText(parsed.event.delta.text);
+      }
+
+      if (parsed?.type === 'assistant') {
+        lastAssistantText = extractAssistantText(parsed.message) || lastAssistantText;
+      }
+
+      if (parsed?.type === 'result') {
+        if (typeof parsed?.result === 'string') {
+          lastResultText = parsed.result;
+        }
+        if (parsed?.subtype === 'error_during_execution') {
+          const errors = Array.isArray(parsed?.errors) ? parsed.errors.filter(Boolean).join('\n') : '';
+          stderrLog = errors || stderrLog;
+        }
+      }
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderrLog += chunk.toString();
+    });
+
+    onStart({
+      stop: () => {
+        try {
+          child.kill();
+        } catch {}
+      },
+      sessionId: resolvedSessionId,
+    });
+
+    child.stdin.write(prompt);
+    child.stdin.end();
+
+    child.on('close', (code) => {
+      const text = (lastAssistantText || lastResultText || '').trim();
+      resolve({
+        ok: code === 0,
+        code,
+        sessionId: resolvedSessionId,
+        text,
+        error: stderrLog.trim() || truncateText(stdoutLog, 2000) || 'Cowork CLI request failed',
+      });
+    });
+
+    child.on('error', (error) => {
+      resolve({
+        ok: false,
+        code: 1,
+        sessionId: resolvedSessionId,
+        text: '',
+        error: error?.message || 'Failed to start hare-code CLI',
+      });
+    });
+  });
+
+  void (async () => {
+    let result = await spawnRun({
+      sessionId: nextSessionId,
+      isResuming: Boolean(previousSessionId),
+    });
+
+    if (!result.ok && isCliSessionInUseError(result.error)) {
+      result = await spawnRun({
+        sessionId: randomUUID(),
+        isResuming: false,
+      });
+    }
+
+    conversation.backend_runtime = 'cli';
+    conversation.backend_session_id = result.sessionId;
+    conversation.backend_started = result.ok;
+
+    if (result.ok) {
+      onDone(result.text || '[模型未返回文本]');
+      return;
+    }
+
+    onError(result.error);
+  })().catch((error) => {
+    conversation.backend_runtime = 'cli';
+    conversation.backend_started = false;
+    onError(error?.message || 'Cowork CLI request failed');
+  });
 }
 
 function createWindow() {
@@ -1477,10 +1718,70 @@ function startApiServer() {
   api.delete('/api/projects/:id', (req, res) => { state.projects = state.projects.filter((item) => item.id !== req.params.id); saveState(); res.json({ ok: true }); });
   api.post('/api/projects/:id/files', upload.single('file'), (req, res) => { const project = state.projects.find((item) => item.id === req.params.id); if (!project || !req.file) return res.status(400).json({ error: 'Upload failed' }); const file = { id: `project-file-${randomUUID()}`, project_id: project.id, file_name: req.file.originalname, file_path: req.file.path, file_size: req.file.size, mime_type: req.file.mimetype, created_at: nowIso() }; project.files.push(file); project.updated_at = nowIso(); saveState(); res.json(file); });
   api.delete('/api/projects/:id/files/:fileId', (req, res) => { const project = state.projects.find((item) => item.id === req.params.id); if (!project) return res.status(404).json({ error: 'Project not found' }); project.files = (project.files || []).filter((item) => item.id !== req.params.fileId); project.updated_at = nowIso(); saveState(); res.json({ ok: true }); });
-  api.get('/api/projects/:id/conversations', (req, res) => { const project = state.projects.find((item) => item.id === req.params.id); if (!project) return res.status(404).json({ error: 'Project not found' }); res.json((project.conversations || []).map((id) => conversationView(state.conversations.find((item) => item.id === id))).filter(Boolean)); });
-  api.post('/api/projects/:id/conversations', (req, res) => { const project = state.projects.find((item) => item.id === req.params.id); if (!project) return res.status(404).json({ error: 'Project not found' }); const conversation = { id: `conv-${randomUUID()}`, title: req.body?.title || 'New Chat', model: req.body?.model || state.chatModels?.[0]?.id || 'claude-sonnet-4-6', workspace_path: project.workspace_path || currentWorkspace, project_id: project.id, messages: [], created_at: nowIso(), updated_at: nowIso() }; state.conversations.unshift(conversation); project.conversations.unshift(conversation.id); saveState(); res.json(conversationView(conversation)); });
-  api.get('/api/conversations', (_req, res) => res.json(state.conversations.map((item) => ({ id: item.id, title: item.title, model: item.model, workspace_path: item.workspace_path || '', updated_at: item.updated_at, created_at: item.created_at, project_id: item.project_id || null }))));
-  api.post('/api/conversations', (req, res) => { const conversation = { id: `conv-${randomUUID()}`, title: req.body?.title || 'New Chat', model: req.body?.model || state.chatModels?.[0]?.id || 'claude-sonnet-4-6', workspace_path: req.body?.workspace_path || currentWorkspace, project_id: null, messages: [], created_at: nowIso(), updated_at: nowIso() }; state.conversations.unshift(conversation); saveState(); res.json(conversationView(conversation)); });
+  api.get('/api/projects/:id/conversations', (req, res) => {
+    const project = state.projects.find((item) => item.id === req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const sessionKind = normalizeSessionKind(req.query?.session_kind);
+    res.json(
+      (project.conversations || [])
+        .map((id) => state.conversations.find((item) => item.id === id))
+        .filter(Boolean)
+        .filter((conversation) => normalizeSessionKind(conversation.session_kind) === sessionKind)
+        .map((conversation) => conversationView(conversation)),
+    );
+  });
+  api.post('/api/projects/:id/conversations', (req, res) => {
+    const project = state.projects.find((item) => item.id === req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    const conversation = {
+      id: `conv-${randomUUID()}`,
+      title: req.body?.title || 'New Chat',
+      model: req.body?.model || state.chatModels?.[0]?.id || 'claude-sonnet-4-6',
+      session_kind: normalizeSessionKind(req.body?.session_kind),
+      workspace_path: project.workspace_path || currentWorkspace,
+      project_id: project.id,
+      messages: [],
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    };
+    state.conversations.unshift(conversation);
+    project.conversations.unshift(conversation.id);
+    saveState();
+    res.json(conversationView(conversation));
+  });
+  api.get('/api/conversations', (req, res) => {
+    const sessionKind = normalizeSessionKind(req.query?.session_kind);
+    res.json(
+      state.conversations
+        .filter((item) => normalizeSessionKind(item.session_kind) === sessionKind)
+        .map((item) => ({
+          id: item.id,
+          title: item.title,
+          model: item.model,
+          session_kind: normalizeSessionKind(item.session_kind),
+          workspace_path: item.workspace_path || '',
+          updated_at: item.updated_at,
+          created_at: item.created_at,
+          project_id: item.project_id || null,
+        })),
+    );
+  });
+  api.post('/api/conversations', (req, res) => {
+    const conversation = {
+      id: `conv-${randomUUID()}`,
+      title: req.body?.title || 'New Chat',
+      model: req.body?.model || state.chatModels?.[0]?.id || 'claude-sonnet-4-6',
+      session_kind: normalizeSessionKind(req.body?.session_kind),
+      workspace_path: req.body?.workspace_path || currentWorkspace,
+      project_id: null,
+      messages: [],
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    };
+    state.conversations.unshift(conversation);
+    saveState();
+    res.json(conversationView(conversation));
+  });
   api.get('/api/conversations/:id', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); conversation ? res.json(conversationView(conversation)) : res.status(404).json({ error: 'Conversation not found' }); });
   api.patch('/api/conversations/:id', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); if (!conversation) return res.status(404).json({ error: 'Conversation not found' }); Object.assign(conversation, req.body || {}, { updated_at: nowIso() }); saveState(); res.json(conversationView(conversation)); });
   api.delete('/api/conversations/:id', async (req, res) => {
@@ -1556,9 +1857,23 @@ function startApiServer() {
     const onDone = (fullText) => { conversation.messages.push({ id: `msg-${randomUUID()}`, role: 'assistant', content: fullText || run.fullText || '[模型未返回文本]', created_at: nowIso(), attachments: [] }); conversation.updated_at = nowIso(); saveState(); write({ type: 'message_stop' }); write('[DONE]'); res.end(); activeRuns.delete(conversation.id); };
     const onError = (error) => { write({ type: 'error', error: error || 'Request failed' }); write('[DONE]'); res.end(); activeRuns.delete(conversation.id); };
     const onStart = (controller) => { run.stop = controller.stop; if (controller.sessionId) conversation.backend_session_id = controller.sessionId; };
-    provider.format === 'openai'
-      ? runViaOpenAI({ provider, prompt: req.body.message || '', onText, onDone, onError, onStart })
-      : void runViaSdk({ conversation, provider, prompt: req.body.message || '', workspacePath: conversation.workspace_path || currentWorkspace, onText, onDone, onError, onStart });
+    const isCoworkSession = normalizeSessionKind(conversation.session_kind) === 'cowork';
+    if (isCoworkSession) {
+      runViaCli({
+        conversation,
+        provider,
+        prompt: req.body.message || '',
+        workspacePath: conversation.workspace_path || currentWorkspace,
+        onText,
+        onDone,
+        onError,
+        onStart,
+      });
+    } else if (provider.format === 'openai') {
+      runViaOpenAI({ provider, prompt: req.body.message || '', onText, onDone, onError, onStart });
+    } else {
+      void runViaSdk({ conversation, provider, prompt: req.body.message || '', workspacePath: conversation.workspace_path || currentWorkspace, onText, onDone, onError, onStart });
+    }
     req.on('aborted', () => {
       if (!res.writableEnded) activeRuns.get(conversation.id)?.stop();
     });

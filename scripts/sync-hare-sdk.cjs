@@ -178,7 +178,7 @@ async function resolveTarballSource(packageSpec) {
 }
 
 function syncFromSibling() {
-  const sourceSdk = path.resolve(hareCodeRoot, 'dist', 'sdk.js');
+  const sourceSdk = path.resolve(hareCodeRoot, 'dist', 'code.js');
   run(bunBinary, ['run', 'build'], { cwd: hareCodeRoot });
 
   if (!fs.existsSync(sourceSdk)) {
@@ -227,7 +227,12 @@ async function syncFromPackage(packageSpec) {
 
   run(tarBinary, ['-xf', tarballName], { cwd: tempDir });
 
-  const packedSdk = path.resolve(tempDir, 'package', 'dist', 'sdk.js');
+  const packedSdk = path.resolve(
+    tempDir,
+    'package',
+    'dist',
+    'code.js',
+  );
   if (!fs.existsSync(packedSdk)) {
     console.error(`Missing packed hare-code SDK bundle: ${packedSdk}`);
     process.exit(1);

@@ -1968,6 +1968,13 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     stopPolling();
     try {
       const data = await getConversation(conversationId);
+      const sessionKind = data?.session_kind === 'cowork' ? 'cowork' : 'chat';
+      const expectedSessionKind = currentMode === 'cowork' ? 'cowork' : 'chat';
+      if (sessionKind !== expectedSessionKind) {
+        navigate(sessionKind === 'cowork' ? `/cowork/${conversationId}` : `/chat/${conversationId}`, { replace: true });
+        setLoading(false);
+        return;
+      }
       // Restore conversation model. If the stored model isn't available in the
       // current user_mode (typical case: user switched modes after the conv was
       // created), DON'T silently fall back — keep showing the original model and
@@ -2319,6 +2326,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         const newConv = await createConversation(undefined, modelForCreate, {
           research_mode: researchMode,
           workspace_path: workspacePath || undefined,
+          session_kind: currentMode === 'cowork' ? 'cowork' : 'chat',
         });
         console.log("Created conversation response:", newConv);
 
@@ -3339,6 +3347,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       const newConv = await createConversation(undefined, modelForCreate, {
         research_mode: researchMode,
         workspace_path: workspacePath || undefined,
+        session_kind: currentMode === 'cowork' ? 'cowork' : 'chat',
       });
       if (!newConv || !newConv.id) throw new Error('Failed to create conversation');
       convId = newConv.id;
