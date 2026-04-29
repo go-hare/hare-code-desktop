@@ -5,16 +5,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { randomUUID } = require('crypto');
-const { spawn } = require('child_process');
 const { EventEmitter } = require('events');
-const readline = require('readline');
+const { pathToFileURL } = require('url');
 
-const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
-const HARE_CODE_ROOT = (() => {
-  const nestedRoot = path.join(PROJECT_ROOT, 'hare-code');
-  if (fs.existsSync(path.join(nestedRoot, 'package.json'))) return nestedRoot;
-  return PROJECT_ROOT;
-})();
+const DESKTOP_ROOT = path.resolve(__dirname, '..');
+const PROJECT_ROOT = path.resolve(DESKTOP_ROOT, '..');
+const KERNEL_VENDOR_ROOT = path.join(__dirname, 'vendor', 'hare-code-kernel');
+const HARE_CODE_ROOT = resolveHareCodeRoot();
 const ENV_PATH = path.join(HARE_CODE_ROOT, '.env');
 const TITLE_BAR_BASE_HEIGHT = 44;
 const DEBUG_LOG = path.join(os.homedir(), 'AppData', 'Roaming', 'hare-desktop', 'main-debug.log');
@@ -50,26 +47,61 @@ const writeJson = (file, value) => {
 const nowIso = () => new Date().toISOString();
 const stripThinking = (model = '') => `${model}`.replace(/-thinking$/, '');
 const roughTokens = (text = '') => Math.max(1, Math.round(`${text}`.length / 4));
-const truncateText = (text = '', maxLength = 2000) =>
-  `${text}`.length > maxLength ? `${`${text}`.slice(0, maxLength)}\n...[truncated]` : `${text}`;
 const inferFormat = (baseUrl = '', model = '') => (/gpt|glm|deepseek|qwen|gemini/i.test(model) || /openai|compatible|v1/i.test(baseUrl)) ? 'openai' : 'anthropic';
 const normalizeSessionKind = (value) => String(value || '').trim() === 'cowork' ? 'cowork' : 'chat';
+
+function resolveHareCodeRoot() {
+  const envRoot = String(process.env.HARE_CODE_ROOT || process.env.HARE_DESKTOP_KERNEL_ROOT || '').trim();
+  const candidates = [
+    envRoot,
+    path.join(PROJECT_ROOT, 'claude-code'),
+    path.join(PROJECT_ROOT, 'hare-code'),
+    PROJECT_ROOT,
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (fs.existsSync(path.join(candidate, 'package.json'))) return candidate;
+  }
+  return PROJECT_ROOT;
+}
+
+function resolveKernelModuleEntry() {
+  const envEntry = String(process.env.HARE_DESKTOP_KERNEL_ENTRY || '').trim();
+  const candidates = [
+    envEntry,
+    path.join(HARE_CODE_ROOT, 'dist', 'kernel.js'),
+    path.join(KERNEL_VENDOR_ROOT, 'dist', 'kernel.js'),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error(`Unable to resolve hare-code kernel.js. Build ../claude-code or run kernel sync for ${KERNEL_VENDOR_ROOT}`);
+}
+
+function loadHareKernelModule() {
+  if (!global.__hareKernelModulePromise) {
+    global.__hareKernelModulePromise = import(pathToFileURL(resolveKernelModuleEntry()).href);
+  }
+  return global.__hareKernelModulePromise;
+}
 
 function resolveCoworkCliEntry() {
   const envEntry = String(process.env.HARE_DESKTOP_CLI_ENTRY || '').trim();
   if (envEntry) return envEntry;
 
-  const distEntry = path.join(HARE_CODE_ROOT, 'dist', 'entrypoints', 'cli.js');
-  if (fs.existsSync(distEntry)) return distEntry;
+  for (const candidate of [
+    path.join(HARE_CODE_ROOT, 'dist', 'cli-bun.js'),
+    path.join(HARE_CODE_ROOT, 'dist', 'cli-node.js'),
+    path.join(HARE_CODE_ROOT, 'dist', 'entrypoints', 'cli.js'),
+    path.join(KERNEL_VENDOR_ROOT, 'dist', 'cli-bun.js'),
+    path.join(KERNEL_VENDOR_ROOT, 'dist', 'cli-node.js'),
+  ]) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
 
   const sourceEntry = path.join(HARE_CODE_ROOT, 'src', 'entrypoints', 'cli.tsx');
   if (fs.existsSync(sourceEntry)) return sourceEntry;
 
   throw new Error(`Unable to resolve hare-code CLI entry under ${HARE_CODE_ROOT}`);
-}
-
-function isCliSessionInUseError(errorText) {
-  return /Session ID .* is already in use/i.test(String(errorText || ''));
 }
 
 function buildCoworkCliArgs({ sessionId, model, isResuming }) {
@@ -132,6 +164,17 @@ function buildCoworkCliEnv(provider) {
     ANTHROPIC_AUTH_TOKEN: apiKey,
     ANTHROPIC_MODEL: model,
   };
+}
+
+function buildKernelSessionFingerprint(provider, workspacePath) {
+  return JSON.stringify({
+    kernelEntry: resolveKernelModuleEntry(),
+    workspacePath: workspacePath || currentWorkspace || PROJECT_ROOT,
+    baseUrl: provider?.baseUrl || '',
+    apiKey: provider?.apiKey || '',
+    model: provider?.model || '',
+    format: provider?.format || '',
+  });
 }
 
 function readEnvSettings() {
@@ -793,56 +836,6 @@ function resolveProvider(conversation, body = {}) {
   return fallback ? { ...fallback, model: modelId || fallback.models?.[0]?.id } : null;
 }
 
-function sdkSessionFingerprint(provider, workspacePath) {
-  return JSON.stringify({
-    workspacePath: workspacePath || currentWorkspace || PROJECT_ROOT,
-    baseUrl: provider?.baseUrl || '',
-    apiKey: provider?.apiKey || '',
-    model: provider?.model || '',
-    format: provider?.format || '',
-  });
-}
-
-function loadHareSdkModule() {
-  if (!global.__hareSdkModulePromise) {
-    global.__hareSdkModulePromise = import('./vendor/hare-code-sdk.js');
-  }
-  return global.__hareSdkModulePromise;
-}
-
-async function getOrCreateDesktopSdkSession({ conversation, provider, workspacePath }) {
-  const key = conversation.id;
-  const fingerprint = sdkSessionFingerprint(provider, workspacePath);
-  const existing = activeRuns.get(`sdk-session:${key}`);
-  if (existing && existing.fingerprint === fingerprint) {
-    return existing.session;
-  }
-
-  if (existing?.session?.close) {
-    await existing.session.close().catch(() => {});
-  }
-
-  const sdk = await loadHareSdkModule();
-  const providerKind = provider?.kind
-    || (inferFormat(provider?.baseUrl, provider?.model) === 'openai'
-      ? 'openai_compat'
-      : 'anthropic');
-  const session = sdk.createHeadlessChatSession({
-    cwd: workspacePath || currentWorkspace || PROJECT_ROOT,
-    sessionId: conversation.backend_session_id || randomUUID(),
-    provider: {
-      kind: providerKind,
-      baseUrl: provider.baseUrl || '',
-      apiKey: provider.apiKey || '',
-      model: provider.model || conversation.model,
-    },
-    includePartialMessages: true,
-  });
-
-  activeRuns.set(`sdk-session:${key}`, { fingerprint, session });
-  return session;
-}
-
 function extractAssistantText(message) {
   if (!message || !Array.isArray(message.content)) return '';
   return message.content.filter((block) => block && block.type === 'text').map((block) => block.text || '').join('');
@@ -879,191 +872,203 @@ function runViaOpenAI({ provider, prompt, onText, onDone, onError, onStart }) {
   }).catch((error) => onError(error?.name === 'AbortError' ? 'Task stopped.' : (error?.message || 'OpenAI request failed')));
 }
 
-async function runViaSdk({ conversation, provider, prompt, workspacePath, onText, onDone, onError, onStart }) {
-  try {
-    const session = await getOrCreateDesktopSdkSession({ conversation, provider, workspacePath });
-    const sessionId = session.getSessionId();
-    let assistant = '';
-    onStart({
-      stop: () => session.abort(),
-      sessionId,
-    });
+function runViaKernel({ conversation, provider, prompt, attachments, workspacePath, onText, onDone, onError, onStart }) {
+  const workspace = workspacePath || currentWorkspace || PROJECT_ROOT;
+  const previousSessionId = conversation.backend_session_id || '';
+  const sessionId = previousSessionId || randomUUID();
+  const turnId = `turn-${randomUUID()}`;
+  const fingerprint = buildKernelSessionFingerprint(provider, workspace);
 
-    for await (const message of session.stream(prompt)) {
-      const delta = message?.type === 'stream_event'
-        && message?.event?.type === 'content_block_delta'
-        ? message?.event?.delta?.text
-        : '';
-      if (delta) {
-        assistant += delta;
-        onText(delta);
-      }
-      if (message?.type === 'assistant') {
-        assistant = extractAssistantText(message.message) || assistant;
-      }
-      if (message?.type === 'result') {
-        conversation.backend_session_id = sessionId;
-        if (typeof message.result === 'string') {
-          assistant = message.result || assistant;
-        }
-        conversation.backend_started = !message.is_error;
-        if (message.is_error) {
-          onError((Array.isArray(message.errors) ? message.errors.join('\n') : '') || assistant || 'SDK request failed');
-        } else {
-          onDone(assistant.trim());
-        }
-        return;
-      }
+  let runtime = null;
+  let kernelConversation = null;
+  let unsubscribe = null;
+  let stopRequested = false;
+  let terminal = false;
+  let streamedText = '';
+  let lastAssistantText = '';
+  let lastResultText = '';
+  let lastErrorText = '';
+
+  const cleanup = async (reason = 'desktop_turn_finished') => {
+    if (unsubscribe) {
+      try { unsubscribe(); } catch {}
+      unsubscribe = null;
     }
+    if (runtime) {
+      const target = runtime;
+      runtime = null;
+      await target.dispose(reason).catch(() => {});
+    }
+  };
 
-    conversation.backend_session_id = sessionId;
-    conversation.backend_started = true;
-    onDone(assistant.trim());
-  } catch (error) {
+  const finish = (kind, value) => {
+    if (terminal) return;
+    terminal = true;
+    const finalText = (lastAssistantText || lastResultText || streamedText || '').trim();
+    if (kind === 'error') {
+      onError(value || lastErrorText || 'Kernel runtime request failed');
+    } else {
+      onDone(value || finalText || '[模型未返回文本]');
+    }
+    void cleanup(kind === 'error' ? 'desktop_turn_failed' : 'desktop_turn_completed');
+  };
+
+  const stop = () => {
+    stopRequested = true;
+    if (kernelConversation) {
+      void kernelConversation.abortTurn(turnId, { reason: 'desktop_stop_generation' }).catch(() => {});
+    }
+    conversation.backend_runtime = 'kernel';
     conversation.backend_started = false;
-    onError(error?.message || 'hare-code SDK request failed');
-  }
-}
+    finish('error', 'Task stopped.');
+  };
 
-function runViaCli({ conversation, provider, prompt, workspacePath, onText, onDone, onError, onStart }) {
-  const previousSessionId =
-    conversation.backend_runtime === 'cli' && conversation.backend_session_id
-      ? conversation.backend_session_id
-      : null;
-  const nextSessionId = previousSessionId || randomUUID();
-  const cliEnv = buildCoworkCliEnv(provider);
-  const args = buildCoworkCliArgs({
-    sessionId: nextSessionId,
-    model: provider?.model || conversation.model,
-    isResuming: Boolean(previousSessionId),
-  });
+  const emitText = (text) => {
+    if (!text || terminal) return;
+    streamedText += text;
+    onText(text);
+  };
 
-  const spawnRun = ({ sessionId, isResuming }) => new Promise((resolve) => {
-    const bunBinary = process.env.BUN_BINARY || (process.platform === 'win32' ? 'bun.exe' : 'bun');
-    const child = spawn(bunBinary, buildCoworkCliArgs({
-      sessionId,
-      model: provider?.model || conversation.model,
-      isResuming,
-    }), {
-      cwd: workspacePath || currentWorkspace || PROJECT_ROOT,
-      env: cliEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-
-    let stderrLog = '';
-    let stdoutLog = '';
-    let lastAssistantText = '';
-    let lastResultText = '';
-    let resolvedSessionId = sessionId;
-
-    const rl = readline.createInterface({ input: child.stdout });
-    rl.on('line', (line) => {
-      const trimmed = String(line || '').trim();
-      if (!trimmed) return;
-      stdoutLog += `${trimmed}\n`;
-
-      let parsed;
-      try {
-        parsed = JSON.parse(trimmed);
-      } catch {
-        return;
-      }
-
-      if (typeof parsed?.session_id === 'string' && parsed.session_id) {
-        resolvedSessionId = parsed.session_id;
-      }
-
-      if (
-        parsed?.type === 'stream_event'
-        && parsed?.event?.type === 'content_block_delta'
-        && parsed?.event?.delta?.type === 'text_delta'
-        && typeof parsed?.event?.delta?.text === 'string'
-      ) {
-        onText(parsed.event.delta.text);
-      }
-
-      if (parsed?.type === 'assistant') {
-        lastAssistantText = extractAssistantText(parsed.message) || lastAssistantText;
-      }
-
-      if (parsed?.type === 'result') {
-        if (typeof parsed?.result === 'string') {
-          lastResultText = parsed.result;
-        }
-        if (parsed?.subtype === 'error_during_execution') {
-          const errors = Array.isArray(parsed?.errors) ? parsed.errors.filter(Boolean).join('\n') : '';
-          stderrLog = errors || stderrLog;
-        }
-      }
-    });
-
-    child.stderr.on('data', (chunk) => {
-      stderrLog += chunk.toString();
-    });
-
-    onStart({
-      stop: () => {
-        try {
-          child.kill();
-        } catch {}
-      },
-      sessionId: resolvedSessionId,
-    });
-
-    child.stdin.write(prompt);
-    child.stdin.end();
-
-    child.on('close', (code) => {
-      const text = (lastAssistantText || lastResultText || '').trim();
-      resolve({
-        ok: code === 0,
-        code,
-        sessionId: resolvedSessionId,
-        text,
-        error: stderrLog.trim() || truncateText(stdoutLog, 2000) || 'Cowork CLI request failed',
-      });
-    });
-
-    child.on('error', (error) => {
-      resolve({
-        ok: false,
-        code: 1,
-        sessionId: resolvedSessionId,
-        text: '',
-        error: error?.message || 'Failed to start hare-code CLI',
-      });
-    });
-  });
-
-  void (async () => {
-    let result = await spawnRun({
-      sessionId: nextSessionId,
-      isResuming: Boolean(previousSessionId),
-    });
-
-    if (!result.ok && isCliSessionInUseError(result.error)) {
-      result = await spawnRun({
-        sessionId: randomUUID(),
-        isResuming: false,
-      });
+  const handleSdkMessage = (message) => {
+    if (!message || typeof message !== 'object') return;
+    if (typeof message.session_id === 'string' && message.session_id) {
+      conversation.backend_session_id = message.session_id;
     }
 
-    conversation.backend_runtime = 'cli';
-    conversation.backend_session_id = result.sessionId;
-    conversation.backend_started = result.ok;
-
-    if (result.ok) {
-      onDone(result.text || '[模型未返回文本]');
+    if (
+      message.type === 'stream_event'
+      && message.event?.type === 'content_block_delta'
+      && message.event?.delta?.type === 'text_delta'
+      && typeof message.event?.delta?.text === 'string'
+    ) {
+      emitText(message.event.delta.text);
       return;
     }
 
-    onError(result.error);
-  })().catch((error) => {
-    conversation.backend_runtime = 'cli';
-    conversation.backend_started = false;
-    onError(error?.message || 'Cowork CLI request failed');
+    if (message.type === 'assistant') {
+      lastAssistantText = extractAssistantText(message.message) || lastAssistantText;
+      return;
+    }
+
+    if (message.type === 'result') {
+      if (typeof message.result === 'string') {
+        lastResultText = message.result;
+      }
+      if (message.is_error) {
+        lastErrorText = (Array.isArray(message.errors) ? message.errors.filter(Boolean).join('\n') : '')
+          || lastResultText
+          || 'Kernel runtime returned an error result';
+      }
+    }
+  };
+
+  const handleKernelEnvelope = (envelope) => {
+    if (!envelope || terminal) return;
+    if (envelope.kind === 'error') {
+      finish('error', envelope.error?.message || 'Kernel runtime request failed');
+      return;
+    }
+
+    const eventType = envelope.payload?.type;
+    const eventPayload = envelope.payload?.payload;
+    if (eventType === 'headless.sdk_message') {
+      handleSdkMessage(eventPayload);
+      return;
+    }
+
+    if (eventType === 'turn.output_delta') {
+      const text = typeof eventPayload?.text === 'string' ? eventPayload.text : '';
+      if (text && !streamedText) emitText(text);
+      return;
+    }
+
+    if (eventType === 'turn.failed') {
+      const message = typeof eventPayload?.error?.message === 'string'
+        ? eventPayload.error.message
+        : lastErrorText;
+      conversation.backend_runtime = 'kernel';
+      conversation.backend_started = false;
+      finish('error', message || 'Kernel runtime turn failed');
+      return;
+    }
+
+    if (eventType === 'turn.completed') {
+      conversation.backend_runtime = 'kernel';
+      conversation.backend_session_id = conversation.backend_session_id || sessionId;
+      conversation.backend_started = true;
+      finish('done');
+    }
+  };
+
+  onStart({
+    stop,
+    sessionId,
   });
+
+  void (async () => {
+    try {
+      const kernel = await loadHareKernelModule();
+      const runtimeId = `desktop-${conversation.id}`;
+      runtime = await kernel.createKernelRuntime({
+        id: runtimeId,
+        runtimeId,
+        workspacePath: workspace,
+        autoStart: true,
+        host: {
+          kind: 'desktop',
+          id: `desktop-host-${conversation.id}`,
+          transport: 'in-process',
+          trustLevel: 'local',
+          declaredCapabilities: ['events', 'conversation', 'turn'],
+          metadata: { app: 'hare-code-desktop' },
+        },
+        headlessExecutor: {
+          command: process.env.BUN_BINARY || (process.platform === 'win32' ? 'bun.exe' : 'bun'),
+          args: buildCoworkCliArgs({
+            sessionId,
+            model: provider?.model || conversation.model,
+            isResuming: Boolean(previousSessionId),
+          }),
+          cwd: workspace,
+          env: buildCoworkCliEnv(provider),
+        },
+      });
+
+      if (stopRequested) {
+        await cleanup('desktop_stop_after_runtime_start');
+        return;
+      }
+
+      kernelConversation = await runtime.createConversation({
+        id: conversation.id,
+        workspacePath: workspace,
+        sessionId,
+        sessionMeta: {
+          desktopConversationId: conversation.id,
+          fingerprint,
+        },
+      });
+      unsubscribe = kernelConversation.onEvent(handleKernelEnvelope);
+
+      if (stopRequested) {
+        await kernelConversation.abortTurn(turnId, { reason: 'desktop_stop_before_run_turn' }).catch(() => {});
+        return;
+      }
+
+      await kernelConversation.runTurn(prompt, {
+        turnId,
+        attachments: attachments || undefined,
+        metadata: {
+          source: 'hare-code-desktop',
+          providerFormat: provider?.format || inferFormat(provider?.baseUrl, provider?.model),
+        },
+      });
+    } catch (error) {
+      conversation.backend_runtime = 'kernel';
+      conversation.backend_started = false;
+      finish('error', error?.message || 'Kernel runtime request failed');
+    }
+  })();
 }
 
 function createWindow() {
@@ -1785,11 +1790,7 @@ function startApiServer() {
   api.get('/api/conversations/:id', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); conversation ? res.json(conversationView(conversation)) : res.status(404).json({ error: 'Conversation not found' }); });
   api.patch('/api/conversations/:id', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); if (!conversation) return res.status(404).json({ error: 'Conversation not found' }); Object.assign(conversation, req.body || {}, { updated_at: nowIso() }); saveState(); res.json(conversationView(conversation)); });
   api.delete('/api/conversations/:id', async (req, res) => {
-    const sdkRun = activeRuns.get(`sdk-session:${req.params.id}`);
-    if (sdkRun?.session?.close) {
-      await sdkRun.session.close().catch(() => {});
-    }
-    activeRuns.delete(`sdk-session:${req.params.id}`);
+    activeRuns.get(req.params.id)?.stop?.();
     state.conversations = state.conversations.filter((item) => item.id !== req.params.id);
     state.projects.forEach((project) => { project.conversations = (project.conversations || []).filter((id) => id !== req.params.id); });
     saveState();
@@ -1858,11 +1859,12 @@ function startApiServer() {
     const onError = (error) => { write({ type: 'error', error: error || 'Request failed' }); write('[DONE]'); res.end(); activeRuns.delete(conversation.id); };
     const onStart = (controller) => { run.stop = controller.stop; if (controller.sessionId) conversation.backend_session_id = controller.sessionId; };
     const isCoworkSession = normalizeSessionKind(conversation.session_kind) === 'cowork';
-    if (isCoworkSession) {
-      runViaCli({
+    if (isCoworkSession || provider.format !== 'openai') {
+      runViaKernel({
         conversation,
         provider,
         prompt: req.body.message || '',
+        attachments: req.body.attachments || [],
         workspacePath: conversation.workspace_path || currentWorkspace,
         onText,
         onDone,
@@ -1871,8 +1873,6 @@ function startApiServer() {
       });
     } else if (provider.format === 'openai') {
       runViaOpenAI({ provider, prompt: req.body.message || '', onText, onDone, onError, onStart });
-    } else {
-      void runViaSdk({ conversation, provider, prompt: req.body.message || '', workspacePath: conversation.workspace_path || currentWorkspace, onText, onDone, onError, onStart });
     }
     req.on('aborted', () => {
       if (!res.writableEnded) activeRuns.get(conversation.id)?.stop();

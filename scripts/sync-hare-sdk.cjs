@@ -4,9 +4,11 @@ const { spawnSync } = require('child_process');
 const { createWriteStream } = require('fs');
 
 const desktopRoot = path.resolve(__dirname, '..');
-const hareCodeRoot = path.resolve(desktopRoot, '..', 'hare-code');
+const workspaceRoot = path.resolve(desktopRoot, '..');
+const hareCodeRoot = resolveHareCodeRoot();
 const vendorDir = path.resolve(desktopRoot, 'electron', 'vendor');
-const targetSdk = path.resolve(vendorDir, 'hare-code-sdk.js');
+const targetKernelRoot = path.resolve(vendorDir, 'hare-code-kernel');
+const targetKernelDist = path.resolve(targetKernelRoot, 'dist');
 const desktopPackagePath = path.resolve(desktopRoot, 'package.json');
 const defaultReleaseRepo = process.env.HARE_CODE_RELEASE_REPO || 'go-hare/hare-code';
 
@@ -16,6 +18,21 @@ const tarBinary = 'tar';
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function resolveHareCodeRoot() {
+  const envRoot = process.env.HARE_CODE_ROOT || process.env.HARE_DESKTOP_KERNEL_ROOT || '';
+  const candidates = [
+    envRoot,
+    path.resolve(workspaceRoot, 'claude-code'),
+    path.resolve(workspaceRoot, 'hare-code'),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (fs.existsSync(path.resolve(candidate, 'package.json'))) {
+      return candidate;
+    }
+  }
+  return path.resolve(workspaceRoot, 'claude-code');
 }
 
 function parseArgs(argv) {
@@ -71,6 +88,24 @@ function run(command, args, options = {}) {
   }
 
   return result;
+}
+
+function syncKernelDist(sourceDist, label) {
+  const kernelEntry = path.resolve(sourceDist, 'kernel.js');
+  if (!fs.existsSync(kernelEntry)) {
+    console.error(`Missing hare-code kernel bundle: ${kernelEntry}`);
+    process.exit(1);
+  }
+
+  fs.rmSync(targetKernelDist, { recursive: true, force: true });
+  fs.mkdirSync(targetKernelRoot, { recursive: true });
+  fs.cpSync(sourceDist, targetKernelDist, { recursive: true });
+  fs.writeFileSync(
+    path.resolve(targetKernelRoot, 'package.json'),
+    `${JSON.stringify({ type: 'module' }, null, 2)}\n`,
+    'utf8',
+  );
+  console.log(`Synced hare-code kernel dist from ${label} -> ${targetKernelDist}`);
 }
 
 async function downloadFile(url, outputPath) {
@@ -178,17 +213,9 @@ async function resolveTarballSource(packageSpec) {
 }
 
 function syncFromSibling() {
-  const sourceSdk = path.resolve(hareCodeRoot, 'dist', 'code.js');
+  const sourceDist = path.resolve(hareCodeRoot, 'dist');
   run(bunBinary, ['run', 'build'], { cwd: hareCodeRoot });
-
-  if (!fs.existsSync(sourceSdk)) {
-    console.error(`Missing hare-code SDK bundle: ${sourceSdk}`);
-    process.exit(1);
-  }
-
-  fs.mkdirSync(vendorDir, { recursive: true });
-  fs.copyFileSync(sourceSdk, targetSdk);
-  console.log(`Synced hare-code SDK from sibling source -> ${targetSdk}`);
+  syncKernelDist(sourceDist, 'sibling source');
 }
 
 async function syncFromPackage(packageSpec) {
@@ -227,23 +254,21 @@ async function syncFromPackage(packageSpec) {
 
   run(tarBinary, ['-xf', tarballName], { cwd: tempDir });
 
-  const packedSdk = path.resolve(
+  const packedDist = path.resolve(
     tempDir,
     'package',
     'dist',
-    'code.js',
   );
-  if (!fs.existsSync(packedSdk)) {
-    console.error(`Missing packed hare-code SDK bundle: ${packedSdk}`);
+  if (!fs.existsSync(path.resolve(packedDist, 'kernel.js'))) {
+    console.error(`Missing packed hare-code kernel bundle: ${path.resolve(packedDist, 'kernel.js')}`);
     process.exit(1);
   }
 
-  fs.mkdirSync(vendorDir, { recursive: true });
-  fs.copyFileSync(packedSdk, targetSdk);
+  syncKernelDist(packedDist, tarballSource.mode === 'npm-pack' ? `package spec "${tarballSource.value}"` : `${tarballSource.mode} "${tarballSource.value}"`);
   if (tarballSource.mode === 'npm-pack') {
-    console.log(`Synced hare-code SDK from package spec "${tarballSource.value}" -> ${targetSdk}`);
+    console.log(`Resolved hare-code package spec "${tarballSource.value}"`);
   } else {
-    console.log(`Synced hare-code SDK from ${tarballSource.mode} "${tarballSource.value}" -> ${targetSdk}`);
+    console.log(`Resolved hare-code package from ${tarballSource.mode} "${tarballSource.value}"`);
   }
 }
 
