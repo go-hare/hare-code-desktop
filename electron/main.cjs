@@ -17,6 +17,7 @@ const TITLE_BAR_BASE_HEIGHT = 44;
 const DEBUG_LOG = path.join(os.homedir(), 'AppData', 'Roaming', 'hare-desktop', 'main-debug.log');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CODEX_SKILLS_ROOT = path.join(CODEX_HOME, 'skills');
+const PERMISSION_REQUEST_TIMEOUT_MS = 120000;
 
 let mainWindow = null;
 let apiServer = null;
@@ -26,10 +27,16 @@ let statePath = '';
 let uploadsDir = '';
 let customSkillsDir = '';
 const activeRuns = new Map();
+const kernelConversations = new Map();
 let state = null;
+let kernelRuntimePromise = null;
 
 const readJson = (file, fallback) => {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+};
+
+const safeStat = (file) => {
+  try { return fs.statSync(file); } catch { return null; }
 };
 
 const debugLog = (message) => {
@@ -84,97 +91,330 @@ function loadHareKernelModule() {
   return global.__hareKernelModulePromise;
 }
 
-function resolveCoworkCliEntry() {
-  const envEntry = String(process.env.HARE_DESKTOP_CLI_ENTRY || '').trim();
-  if (envEntry) return envEntry;
-
-  for (const candidate of [
-    path.join(HARE_CODE_ROOT, 'dist', 'cli-bun.js'),
-    path.join(HARE_CODE_ROOT, 'dist', 'cli-node.js'),
-    path.join(HARE_CODE_ROOT, 'dist', 'entrypoints', 'cli.js'),
-    path.join(KERNEL_VENDOR_ROOT, 'dist', 'cli-bun.js'),
-    path.join(KERNEL_VENDOR_ROOT, 'dist', 'cli-node.js'),
-  ]) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-
-  const sourceEntry = path.join(HARE_CODE_ROOT, 'src', 'entrypoints', 'cli.tsx');
-  if (fs.existsSync(sourceEntry)) return sourceEntry;
-
-  throw new Error(`Unable to resolve hare-code CLI entry under ${HARE_CODE_ROOT}`);
+function getBunBinary() {
+  return process.env.BUN_BINARY || (process.platform === 'win32' ? 'bun.exe' : 'bun');
 }
 
-function buildCoworkCliArgs({ sessionId, model, isResuming }) {
-  const args = [
-    resolveCoworkCliEntry(),
-    '-p',
-    '--output-format',
-    'stream-json',
-    '--include-partial-messages',
-    '--verbose',
-    '--dangerously-skip-permissions',
-  ];
-
-  if (isResuming) {
-    args.push('--resume', sessionId);
-  } else {
-    args.push('--session-id', sessionId);
-  }
-
-  if (model && String(model).trim()) {
-    args.push('--model', String(model).trim());
-  }
-
-  return args;
+function toRuntimeProviderSelection(provider, modelId, conversationId) {
+  const normalizedModel = String(modelId || provider?.model || '').trim();
+  const baseUrl = String(provider?.baseUrl || '').trim();
+  const format = provider?.format || inferFormat(baseUrl, normalizedModel);
+  const providerId = String(provider?.id || '').trim() || `desktop-inline-${conversationId}`;
+  return {
+    providerId,
+    kind: format === 'openai' ? 'openai-compatible' : 'anthropic',
+    model: normalizedModel || undefined,
+    baseURL: baseUrl || undefined,
+    authRef: { type: 'desktop', id: providerId },
+    metadata: {
+      desktopProviderName: provider?.name || providerId,
+      desktopFormat: format,
+      supportsWebSearch: Boolean(provider?.supportsWebSearch),
+      webSearchStrategy: provider?.webSearchStrategy || null,
+    },
+  };
 }
 
-function buildCoworkCliEnv(provider) {
-  const model = String(provider?.model || '').trim();
+function buildKernelCapabilityIntent(providerSelection) {
+  return {
+    provider: providerSelection,
+    tools: true,
+    mcp: true,
+    hooks: true,
+    skills: true,
+    plugins: true,
+    agents: true,
+    tasks: true,
+    companion: true,
+    kairos: true,
+    memory: true,
+    sessions: true,
+  };
+}
+
+function buildKernelProviderSecret(provider, providerSelection) {
   const baseUrl = String(provider?.baseUrl || '').trim();
   const apiKey = String(provider?.apiKey || '').trim();
+  const model = String(provider?.model || providerSelection?.model || '').trim();
   const format = provider?.format || inferFormat(baseUrl, model);
-
-  const baseEnv = {
-    ...process.env,
-    CLAUDE_CODE_IS_COWORK: '1',
-    CLAUDE_CODE_USE_OPENAI_COMPAT: '',
-    OPENAI_COMPAT_BASE_URL: '',
-    OPENAI_COMPAT_API_KEY: '',
-    OPENAI_COMPAT_MODEL: '',
-    ANTHROPIC_BASE_URL: '',
-    ANTHROPIC_API_KEY: '',
-    ANTHROPIC_AUTH_TOKEN: '',
-    ANTHROPIC_MODEL: '',
-  };
-
-  if (format === 'openai') {
-    return {
-      ...baseEnv,
-      CLAUDE_CODE_USE_OPENAI_COMPAT: '1',
-      OPENAI_COMPAT_BASE_URL: baseUrl,
-      OPENAI_COMPAT_API_KEY: apiKey,
-      OPENAI_COMPAT_MODEL: model,
-    };
-  }
-
+  if (!baseUrl && !apiKey && !model) return undefined;
   return {
-    ...baseEnv,
-    ANTHROPIC_BASE_URL: baseUrl,
-    ANTHROPIC_API_KEY: apiKey,
-    ANTHROPIC_AUTH_TOKEN: apiKey,
-    ANTHROPIC_MODEL: model,
+    providerId: providerSelection.providerId,
+    format,
+    model: model || undefined,
+    baseUrl: baseUrl || undefined,
+    apiKey: apiKey || undefined,
   };
 }
 
-function buildKernelSessionFingerprint(provider, workspacePath) {
-  return JSON.stringify({
-    kernelEntry: resolveKernelModuleEntry(),
-    workspacePath: workspacePath || currentWorkspace || PROJECT_ROOT,
-    baseUrl: provider?.baseUrl || '',
-    apiKey: provider?.apiKey || '',
-    model: provider?.model || '',
-    format: provider?.format || '',
+function buildKernelTurnMetadata({ conversation, provider, providerSelection, sessionId, isResuming }) {
+  const metadata = {
+    source: 'hare-code-desktop',
+    providerId: providerSelection.providerId,
+    providerFormat: provider?.format || inferFormat(provider?.baseUrl, provider?.model),
+    desktopSession: {
+      sessionId,
+      isResuming,
+      conversationId: conversation.id,
+    },
+  };
+  const secret = buildKernelProviderSecret(provider, providerSelection);
+  if (secret) {
+    metadata.desktopProviderSecret = secret;
+  }
+  return metadata;
+}
+
+function buildKernelConversationMetadata({ conversation, provider, providerSelection, sessionId }) {
+  const metadata = {
+    source: 'hare-code-desktop',
+    sessionKind: normalizeSessionKind(conversation.session_kind),
+    providerId: providerSelection.providerId,
+    providerFormat: provider?.format || inferFormat(provider?.baseUrl, provider?.model),
+    desktopSession: {
+      sessionId,
+      isResuming: Boolean(sessionId),
+      conversationId: conversation.id,
+    },
+  };
+  const secret = buildKernelProviderSecret(provider, providerSelection);
+  if (secret) {
+    metadata.desktopProviderSecret = secret;
+  }
+  return metadata;
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    const text = String(value || '').trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+function toAttachmentDisplayPath(filePath, workspacePath) {
+  const absolutePath = String(filePath || '').trim();
+  const basePath = String(workspacePath || '').trim();
+  if (!absolutePath) return '';
+  if (basePath) {
+    try {
+      const relativePath = path.relative(basePath, absolutePath);
+      if (relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath)) {
+        return relativePath.replace(/\\/g, '/');
+      }
+    } catch {}
+  }
+  return path.basename(absolutePath);
+}
+
+function resolveUploadAttachment(rawAttachment, workspacePath) {
+  const attachmentId = firstNonEmptyString(rawAttachment?.fileId, rawAttachment?.id);
+  if (!attachmentId) return null;
+  const upload = state.uploads.find((item) => item.id === attachmentId);
+  if (!upload?.path || !fs.existsSync(upload.path)) return null;
+  return {
+    type: 'file',
+    source: 'desktop_upload',
+    attachmentId: upload.id,
+    path: upload.path,
+    localPath: upload.path,
+    filename: upload.file_name || path.basename(upload.path),
+    displayPath: toAttachmentDisplayPath(upload.path, workspacePath),
+    mimeType: upload.mime_type || '',
+    fileType: upload.file_type || 'document',
+    size: Number(upload.size || 0),
+  };
+}
+
+function resolveGithubAttachment(rawAttachment, conversation, workspacePath) {
+  const source = firstNonEmptyString(rawAttachment?.source, rawAttachment?.fileType, rawAttachment?.file_type);
+  const attachmentId = firstNonEmptyString(rawAttachment?.fileId, rawAttachment?.id);
+  if (source !== 'github' && !attachmentId.startsWith('github:')) return null;
+  const repoFullName = firstNonEmptyString(
+    rawAttachment?.ghRepo,
+    rawAttachment?.gh_repo,
+    rawAttachment?.fileName,
+    rawAttachment?.file_name,
+    attachmentId.replace(/^github:/, ''),
+  );
+  if (!repoFullName) return null;
+  const ref = firstNonEmptyString(rawAttachment?.ghRef, rawAttachment?.gh_ref, 'main');
+  const targetRoot = githubTargetRoot(conversation, repoFullName, ref);
+  if (!fs.existsSync(targetRoot)) return null;
+  return {
+    type: 'directory',
+    source: 'github',
+    attachmentId: attachmentId || `github:${repoFullName}`,
+    path: targetRoot,
+    localPath: targetRoot,
+    displayPath: toAttachmentDisplayPath(targetRoot, workspacePath),
+    filename: repoFullName,
+    repoFullName,
+    ref,
+  };
+}
+
+function resolveRuntimeAttachment(rawAttachment, conversation, workspacePath) {
+  if (!rawAttachment || typeof rawAttachment !== 'object') return null;
+  const githubAttachment = resolveGithubAttachment(rawAttachment, conversation, workspacePath);
+  if (githubAttachment) return githubAttachment;
+  const uploadAttachment = resolveUploadAttachment(rawAttachment, workspacePath);
+  if (uploadAttachment) return uploadAttachment;
+
+  const explicitPath = firstNonEmptyString(
+    rawAttachment.path,
+    rawAttachment.localPath,
+    rawAttachment.filePath,
+    rawAttachment.file_path,
+  );
+  if (!explicitPath || !fs.existsSync(explicitPath)) return null;
+  const stats = safeStat(explicitPath);
+  return {
+    type: stats?.isDirectory?.() ? 'directory' : 'file',
+    source: rawAttachment.source || 'explicit_path',
+    attachmentId: firstNonEmptyString(rawAttachment.fileId, rawAttachment.id) || undefined,
+    path: explicitPath,
+    localPath: explicitPath,
+    filename: firstNonEmptyString(rawAttachment.fileName, rawAttachment.file_name, path.basename(explicitPath)),
+    displayPath: toAttachmentDisplayPath(explicitPath, workspacePath),
+    mimeType: firstNonEmptyString(rawAttachment.mimeType, rawAttachment.mime_type),
+    fileType: firstNonEmptyString(rawAttachment.fileType, rawAttachment.file_type),
+    size: Number(rawAttachment.size || rawAttachment.file_size || 0),
+  };
+}
+
+function resolveRuntimeAttachments(rawAttachments, conversation, workspacePath) {
+  if (!Array.isArray(rawAttachments) || !rawAttachments.length) return [];
+  return rawAttachments
+    .map((attachment) => resolveRuntimeAttachment(attachment, conversation, workspacePath))
+    .filter(Boolean);
+}
+
+function isKernelRuntimeTransportError(error) {
+  const message = String(error?.message || error || '');
+  return /EPIPE|write after end|closed|disposed|EOF|broken pipe|transport|spawn|exited/i.test(message);
+}
+
+function isGenericKernelTurnFailureMessage(message) {
+  return /^(ask_result_error|error_during_execution|Headless runtime turn failed)$/i.test(String(message || '').trim());
+}
+
+function isKernelTurnErrorStopReason(stopReason) {
+  return /^(ask_result_error|error_during_execution)$/i.test(String(stopReason || '').trim());
+}
+
+function normalizePermissionDecision(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['allow', 'allow_once', 'allow_session', 'deny', 'abort'].includes(normalized)) {
+    return normalized;
+  }
+  return 'deny';
+}
+
+function normalizePermissionDecisionSource(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['host', 'policy', 'timeout', 'runtime'].includes(normalized)) {
+    return normalized;
+  }
+  return 'host';
+}
+
+function serializePermissionRequest(request) {
+  return {
+    permission_request_id: String(request?.permissionRequestId || '').trim(),
+    tool_name: String(request?.toolName || '').trim(),
+    action: String(request?.action || '').trim(),
+    risk: String(request?.risk || '').trim().toLowerCase(),
+    arguments_preview: request?.argumentsPreview,
+    policy_snapshot: request?.policySnapshot,
+    metadata: request?.metadata || null,
+    timeout_ms: Number(request?.timeoutMs || 0) || PERMISSION_REQUEST_TIMEOUT_MS,
+  };
+}
+
+function serializePermissionResolved(payload) {
+  return {
+    permission_request_id: String(payload?.permissionRequestId || '').trim(),
+    decision: normalizePermissionDecision(payload?.decision),
+    decided_by: normalizePermissionDecisionSource(payload?.decidedBy),
+    reason: String(payload?.reason || '').trim(),
+    metadata: payload?.metadata || null,
+  };
+}
+
+async function resetKernelRuntime(reason = 'desktop_runtime_reset') {
+  const current = kernelRuntimePromise;
+  kernelRuntimePromise = null;
+  kernelConversations.clear();
+  if (!current) return;
+  try {
+    const runtime = await current;
+    await runtime.dispose(reason).catch(() => {});
+  } catch {}
+}
+
+async function getKernelRuntime() {
+  if (kernelRuntimePromise) return kernelRuntimePromise;
+  kernelRuntimePromise = (async () => {
+    const kernel = await loadHareKernelModule();
+    return kernel.createKernelRuntime({
+      transportConfig: {
+        kind: 'stdio',
+        command: getBunBinary(),
+        args: [path.join(__dirname, 'worker.cjs')],
+        env: {
+          ...process.env,
+          HARE_DESKTOP_KERNEL_ENTRY: resolveKernelModuleEntry(),
+        },
+        stderr: (chunk) => {
+          const text = String(chunk || '').trimEnd();
+          if (text) debugLog(`[kernel-worker] ${text}`);
+        },
+      },
+      autoStart: true,
+    });
+  })();
+  try {
+    return await kernelRuntimePromise;
+  } catch (error) {
+    kernelRuntimePromise = null;
+    kernelConversations.clear();
+    throw error;
+  }
+}
+
+async function getKernelConversation(conversation, providerSelection, runtime) {
+  const existing = kernelConversations.get(conversation.id);
+  if (existing) return existing;
+  const activeRuntime = runtime || await getKernelRuntime();
+  const provider = state.providers.find((item) => String(item.id || '').trim() === providerSelection.providerId)
+    || state.providers.find((item) => item.enabled !== false && (item.models || []).some((model) => model.id === providerSelection.model))
+    || null;
+  const kernelConversation = await activeRuntime.createConversation({
+    id: conversation.id,
+    workspacePath: conversation.workspace_path || currentWorkspace || PROJECT_ROOT,
+    sessionId: conversation.backend_session_id || undefined,
+    provider: providerSelection,
+    capabilityIntent: buildKernelCapabilityIntent(providerSelection),
+    metadata: buildKernelConversationMetadata({
+      conversation,
+      provider,
+      providerSelection,
+      sessionId: conversation.backend_session_id || undefined,
+    }),
   });
+  kernelConversations.set(conversation.id, kernelConversation);
+  if (kernelConversation.sessionId) {
+    conversation.backend_session_id = kernelConversation.sessionId;
+  }
+  return kernelConversation;
+}
+
+async function disposeKernelConversation(conversationId, reason = 'desktop_conversation_deleted') {
+  const kernelConversation = kernelConversations.get(conversationId);
+  kernelConversations.delete(conversationId);
+  if (!kernelConversation) return;
+  await kernelConversation.dispose(reason).catch(() => {});
 }
 
 function readEnvSettings() {
@@ -841,43 +1081,16 @@ function extractAssistantText(message) {
   return message.content.filter((block) => block && block.type === 'text').map((block) => block.text || '').join('');
 }
 
-function runViaOpenAI({ provider, prompt, onText, onDone, onError, onStart }) {
-  const controller = new AbortController();
-  onStart({ stop: () => controller.abort() });
-  fetch(`${provider.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.apiKey}` },
-    body: JSON.stringify({ model: provider.model || 'gpt-4o', messages: [{ role: 'user', content: prompt }], stream: true, max_tokens: 8192 }),
-    signal: controller.signal,
-  }).then(async (response) => {
-    if (!response.ok || !response.body) throw new Error((await response.text().catch(() => '')).slice(0, 300) || `HTTP ${response.status}`);
-    const decoder = new TextDecoder();
-    let buffer = '', full = '';
-    for await (const chunk of response.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const payload = line.slice(6).trim();
-        if (payload === '[DONE]') return onDone(full);
-        try {
-          const parsed = JSON.parse(payload);
-          const text = parsed?.choices?.[0]?.delta?.content;
-          if (text) { full += text; onText(text); }
-        } catch {}
-      }
-    }
-    onDone(full);
-  }).catch((error) => onError(error?.name === 'AbortError' ? 'Task stopped.' : (error?.message || 'OpenAI request failed')));
-}
-
-function runViaKernel({ conversation, provider, prompt, attachments, workspacePath, onText, onDone, onError, onStart }) {
+function runViaKernel({ conversation, provider, prompt, attachments, workspacePath, onText, onDone, onError, onStart, onPermissionRequest, onPermissionResolved }) {
   const workspace = workspacePath || currentWorkspace || PROJECT_ROOT;
-  const previousSessionId = conversation.backend_session_id || '';
+  const previousSessionId = String(conversation.backend_session_id || '').trim();
   const sessionId = previousSessionId || randomUUID();
   const turnId = `turn-${randomUUID()}`;
-  const fingerprint = buildKernelSessionFingerprint(provider, workspace);
+  const providerSelection = toRuntimeProviderSelection(
+    provider,
+    stripThinking(conversation.model) || conversation.model,
+    conversation.id,
+  );
 
   let runtime = null;
   let kernelConversation = null;
@@ -888,16 +1101,12 @@ function runViaKernel({ conversation, provider, prompt, attachments, workspacePa
   let lastAssistantText = '';
   let lastResultText = '';
   let lastErrorText = '';
+  let runtimeSessionId = previousSessionId || sessionId;
 
-  const cleanup = async (reason = 'desktop_turn_finished') => {
+  const cleanup = () => {
     if (unsubscribe) {
       try { unsubscribe(); } catch {}
       unsubscribe = null;
-    }
-    if (runtime) {
-      const target = runtime;
-      runtime = null;
-      await target.dispose(reason).catch(() => {});
     }
   };
 
@@ -910,16 +1119,16 @@ function runViaKernel({ conversation, provider, prompt, attachments, workspacePa
     } else {
       onDone(value || finalText || '[模型未返回文本]');
     }
-    void cleanup(kind === 'error' ? 'desktop_turn_failed' : 'desktop_turn_completed');
+    cleanup();
   };
 
   const stop = () => {
+    if (terminal || stopRequested) return;
     stopRequested = true;
     if (kernelConversation) {
       void kernelConversation.abortTurn(turnId, { reason: 'desktop_stop_generation' }).catch(() => {});
+      return;
     }
-    conversation.backend_runtime = 'kernel';
-    conversation.backend_started = false;
     finish('error', 'Task stopped.');
   };
 
@@ -929,10 +1138,59 @@ function runViaKernel({ conversation, provider, prompt, attachments, workspacePa
     onText(text);
   };
 
+  const decidePermission = async ({ permissionRequestId, decision, decidedBy = 'host', reason = '' }) => {
+    const normalizedRequestId = String(permissionRequestId || '').trim();
+    if (!runtime || !normalizedRequestId) {
+      throw new Error('Kernel runtime permission broker unavailable');
+    }
+    return runtime.decidePermission({
+      permissionRequestId: normalizedRequestId,
+      decision: normalizePermissionDecision(decision),
+      decidedBy: normalizePermissionDecisionSource(decidedBy),
+      reason: String(reason || '').trim(),
+    });
+  };
+
+  const failTurn = (message) => {
+    debugLog(`kernel turn failed for ${conversation.id}: ${message || 'Kernel runtime turn failed'}`);
+    conversation.backend_runtime = 'kernel';
+    conversation.backend_started = false;
+    conversation.backend_session_id = undefined;
+    void disposeKernelConversation(conversation.id, 'desktop_turn_failed');
+    finish('error', message || 'Kernel runtime turn failed');
+  };
+
+  const completeTurn = (stopReason) => {
+    debugLog(`kernel turn completed for ${conversation.id}: stopReason=${stopReason || 'end_turn'}`);
+    conversation.backend_runtime = 'kernel';
+    conversation.backend_session_id = runtimeSessionId || conversation.backend_session_id || kernelConversation?.sessionId || sessionId;
+    conversation.backend_started = false;
+    if (stopRequested || stopReason === 'aborted') {
+      finish('error', 'Task stopped.');
+      return;
+    }
+    if (lastErrorText && isKernelTurnErrorStopReason(stopReason)) {
+      conversation.backend_session_id = undefined;
+      void disposeKernelConversation(conversation.id, 'desktop_turn_failed');
+      finish('error', lastErrorText);
+      return;
+    }
+    if (!(lastAssistantText || lastResultText || streamedText || '').trim()) {
+      conversation.backend_session_id = undefined;
+      void disposeKernelConversation(conversation.id, 'desktop_turn_empty_output');
+      void resetKernelRuntime('desktop_turn_empty_output');
+      finish('error', 'Kernel runtime returned no text. Session was reset; please retry.');
+      return;
+    }
+    conversation.backend_started = true;
+    finish('done');
+  };
+
   const handleSdkMessage = (message) => {
     if (!message || typeof message !== 'object') return;
     if (typeof message.session_id === 'string' && message.session_id) {
-      conversation.backend_session_id = message.session_id;
+      runtimeSessionId = message.session_id;
+      conversation.backend_session_id = runtimeSessionId;
     }
 
     if (
@@ -962,15 +1220,49 @@ function runViaKernel({ conversation, provider, prompt, attachments, workspacePa
     }
   };
 
+  const handlePermissionRequest = (request) => {
+    const permissionRequestId = String(request?.permissionRequestId || '').trim();
+    if (!permissionRequestId) return;
+    const serialized = serializePermissionRequest(request);
+    debugLog(`permission requested for ${conversation.id}: tool=${serialized.tool_name || ''} risk=${serialized.risk || ''}`);
+    if (typeof onPermissionRequest === 'function') {
+      onPermissionRequest(serialized);
+      return;
+    }
+    void decidePermission({
+      permissionRequestId,
+      decision: 'abort',
+      decidedBy: 'host',
+      reason: 'Desktop permission UI not connected yet',
+    }).catch((error) => {
+      debugLog(`failed to resolve permission request ${permissionRequestId}: ${error?.message || error}`);
+    });
+  };
+
   const handleKernelEnvelope = (envelope) => {
     if (!envelope || terminal) return;
     if (envelope.kind === 'error') {
+      if (isKernelRuntimeTransportError(envelope.error)) {
+        void resetKernelRuntime('desktop_runtime_worker_error');
+      }
       finish('error', envelope.error?.message || 'Kernel runtime request failed');
       return;
     }
 
     const eventType = envelope.payload?.type;
     const eventPayload = envelope.payload?.payload;
+    if (eventType === 'permission.requested') {
+      handlePermissionRequest(eventPayload);
+      return;
+    }
+
+    if (eventType === 'permission.resolved') {
+      if (typeof onPermissionResolved === 'function') {
+        onPermissionResolved(serializePermissionResolved(eventPayload));
+      }
+      return;
+    }
+
     if (eventType === 'headless.sdk_message') {
       handleSdkMessage(eventPayload);
       return;
@@ -983,87 +1275,90 @@ function runViaKernel({ conversation, provider, prompt, attachments, workspacePa
     }
 
     if (eventType === 'turn.failed') {
-      const message = typeof eventPayload?.error?.message === 'string'
+      const eventMessage = typeof eventPayload?.error?.message === 'string'
         ? eventPayload.error.message
+        : '';
+      const message = !isGenericKernelTurnFailureMessage(eventMessage)
+        ? eventMessage
         : lastErrorText;
+      failTurn(message);
+      return;
+    }
+
+    if (eventType === 'turn.abort_requested') {
       conversation.backend_runtime = 'kernel';
       conversation.backend_started = false;
-      finish('error', message || 'Kernel runtime turn failed');
+      finish('error', 'Task stopped.');
       return;
     }
 
     if (eventType === 'turn.completed') {
-      conversation.backend_runtime = 'kernel';
-      conversation.backend_session_id = conversation.backend_session_id || sessionId;
-      conversation.backend_started = true;
-      finish('done');
+      completeTurn(eventPayload?.stopReason);
     }
   };
 
   onStart({
     stop,
     sessionId,
+    decidePermission,
   });
 
   void (async () => {
     try {
-      const kernel = await loadHareKernelModule();
-      const runtimeId = `desktop-${conversation.id}`;
-      runtime = await kernel.createKernelRuntime({
-        id: runtimeId,
-        runtimeId,
-        workspacePath: workspace,
-        autoStart: true,
-        host: {
-          kind: 'desktop',
-          id: `desktop-host-${conversation.id}`,
-          transport: 'in-process',
-          trustLevel: 'local',
-          declaredCapabilities: ['events', 'conversation', 'turn'],
-          metadata: { app: 'hare-code-desktop' },
-        },
-        headlessExecutor: {
-          command: process.env.BUN_BINARY || (process.platform === 'win32' ? 'bun.exe' : 'bun'),
-          args: buildCoworkCliArgs({
-            sessionId,
-            model: provider?.model || conversation.model,
-            isResuming: Boolean(previousSessionId),
-          }),
-          cwd: workspace,
-          env: buildCoworkCliEnv(provider),
-        },
-      });
-
-      if (stopRequested) {
-        await cleanup('desktop_stop_after_runtime_start');
-        return;
-      }
-
-      kernelConversation = await runtime.createConversation({
-        id: conversation.id,
-        workspacePath: workspace,
-        sessionId,
-        sessionMeta: {
-          desktopConversationId: conversation.id,
-          fingerprint,
-        },
-      });
+      conversation.backend_session_id = sessionId;
+      debugLog(`runViaKernel start ${conversation.id}: session=${sessionId} workspace=${workspace}`);
+      runtime = await getKernelRuntime();
+      debugLog(`runViaKernel runtime ready ${conversation.id}`);
+      kernelConversation = await getKernelConversation({
+        ...conversation,
+        workspace_path: workspace,
+        backend_session_id: sessionId,
+      }, providerSelection, runtime);
+      debugLog(`runViaKernel conversation ready ${conversation.id}: runtimeSession=${kernelConversation.sessionId || ''}`);
+      runtimeSessionId = conversation.backend_session_id || kernelConversation.sessionId || runtimeSessionId;
+      conversation.backend_session_id = runtimeSessionId;
       unsubscribe = kernelConversation.onEvent(handleKernelEnvelope);
 
       if (stopRequested) {
-        await kernelConversation.abortTurn(turnId, { reason: 'desktop_stop_before_run_turn' }).catch(() => {});
+        finish('error', 'Task stopped.');
         return;
       }
 
-      await kernelConversation.runTurn(prompt, {
+      debugLog(`runViaKernel runTurn ${conversation.id}: turn=${turnId}`);
+      const turnSnapshot = await kernelConversation.runTurn(prompt, {
         turnId,
         attachments: attachments || undefined,
+        providerOverride: providerSelection,
         metadata: {
-          source: 'hare-code-desktop',
-          providerFormat: provider?.format || inferFormat(provider?.baseUrl, provider?.model),
+          ...buildKernelTurnMetadata({
+            conversation,
+            provider,
+            providerSelection,
+            sessionId,
+            isResuming: Boolean(previousSessionId),
+          }),
         },
       });
+      debugLog(`runViaKernel runTurn returned ${conversation.id}: state=${turnSnapshot?.state || 'unknown'} stopReason=${turnSnapshot?.stopReason || ''}`);
+      if (terminal) {
+        return;
+      }
+      if (turnSnapshot?.state === 'completed') {
+        completeTurn(turnSnapshot.stopReason);
+        return;
+      }
+      if (turnSnapshot?.state === 'failed') {
+        const snapshotMessage = typeof turnSnapshot?.error?.message === 'string'
+          ? turnSnapshot.error.message
+          : '';
+        failTurn(snapshotMessage || lastErrorText);
+        return;
+      }
+      return;
     } catch (error) {
+      if (isKernelRuntimeTransportError(error)) {
+        await resetKernelRuntime('desktop_runtime_failed');
+      }
       conversation.backend_runtime = 'kernel';
       conversation.backend_started = false;
       finish('error', error?.message || 'Kernel runtime request failed');
@@ -1791,6 +2086,8 @@ function startApiServer() {
   api.patch('/api/conversations/:id', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); if (!conversation) return res.status(404).json({ error: 'Conversation not found' }); Object.assign(conversation, req.body || {}, { updated_at: nowIso() }); saveState(); res.json(conversationView(conversation)); });
   api.delete('/api/conversations/:id', async (req, res) => {
     activeRuns.get(req.params.id)?.stop?.();
+    activeRuns.delete(req.params.id);
+    await disposeKernelConversation(req.params.id, 'desktop_conversation_deleted');
     state.conversations = state.conversations.filter((item) => item.id !== req.params.id);
     state.projects.forEach((project) => { project.conversations = (project.conversations || []).filter((id) => id !== req.params.id); });
     saveState();
@@ -1799,10 +2096,31 @@ function startApiServer() {
   api.delete('/api/conversations/:id/messages/:messageId', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); if (!conversation) return res.status(404).json({ error: 'Conversation not found' }); const index = (conversation.messages || []).findIndex((item) => item.id === req.params.messageId); if (index >= 0) conversation.messages = conversation.messages.slice(0, index); conversation.updated_at = nowIso(); saveState(); res.json(conversationView(conversation)); });
   api.delete('/api/conversations/:id/messages-tail/:count', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); if (!conversation) return res.status(404).json({ error: 'Conversation not found' }); conversation.messages = conversation.messages.slice(0, Math.max(0, conversation.messages.length - Number(req.params.count || 0))); conversation.updated_at = nowIso(); saveState(); res.json(conversationView(conversation)); });
   api.get('/api/conversations/:id/generation-status', (req, res) => res.json({ active: activeRuns.has(req.params.id), status: activeRuns.has(req.params.id) ? 'generating' : 'idle', crossProcess: false }));
-  api.post('/api/conversations/:id/stop-generation', (req, res) => { activeRuns.get(req.params.id)?.stop(); activeRuns.delete(req.params.id); res.json({ ok: true }); });
+  api.post('/api/conversations/:id/stop-generation', (req, res) => { activeRuns.get(req.params.id)?.stop(); res.json({ ok: true }); });
   api.get('/api/conversations/:id/context-size', (req, res) => { const conversation = state.conversations.find((item) => item.id === req.params.id); const tokens = (conversation?.messages || []).reduce((sum, item) => sum + roughTokens(item.content), 0); res.json({ tokens, limit: 200000 }); });
   api.post('/api/conversations/:id/compact', (_req, res) => res.json({ summary: 'Local desktop backend does not compact yet.', tokensSaved: 0, messagesCompacted: 0 }));
   api.post('/api/conversations/:id/answer', (_req, res) => res.json({ ok: true }));
+  api.post('/api/conversations/:id/permissions/:permissionRequestId', async (req, res) => {
+    const run = activeRuns.get(req.params.id);
+    if (!run) return res.status(404).json({ error: 'No active run for this conversation' });
+    if (typeof run.resolvePermission !== 'function') {
+      return res.status(409).json({ error: 'Permission broker unavailable' });
+    }
+    try {
+      debugLog(`permission decision api start ${req.params.id}: request=${req.params.permissionRequestId} decision=${req.body?.decision || ''}`);
+      await run.resolvePermission({
+        permissionRequestId: req.params.permissionRequestId,
+        decision: req.body?.decision,
+        reason: req.body?.reason,
+      });
+      debugLog(`permission decision api done ${req.params.id}: request=${req.params.permissionRequestId}`);
+      res.json({ ok: true });
+    } catch (error) {
+      debugLog(`permission decision api failed ${req.params.id}: request=${req.params.permissionRequestId} message=${error?.message || error}`);
+      const statusCode = Number(error?.statusCode || 0) || 500;
+      res.status(statusCode).json({ error: error?.message || 'Failed to resolve permission request' });
+    }
+  });
   api.post('/api/conversations/:id/warm', (_req, res) => res.json({ ok: true }));
   api.get('/api/conversations/:id/stream-status', (req, res) => { const run = activeRuns.get(req.params.id); res.json({ active: Boolean(run), eventCount: run?.buffer.length || 0 }); });
   api.get('/api/conversations/:id/reconnect', (req, res) => {
@@ -1843,39 +2161,160 @@ function startApiServer() {
   api.post('/api/chat', (req, res) => {
     const conversation = state.conversations.find((item) => item.id === req.body?.conversation_id);
     if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+    debugLog(`api chat start ${req.body?.conversation_id || ''}: model=${conversation.model || ''}`);
     const provider = resolveProvider(conversation, req.body || {});
     if (!provider) return res.status(400).json({ error: 'No provider configured for this model' });
-    const write = (payload) => { const line = `data: ${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n\n`; activeRuns.get(conversation.id)?.buffer.push(line); activeRuns.get(conversation.id)?.emitter.emit('line', line); res.write(line); };
+    const runtimeAttachments = resolveRuntimeAttachments(
+      req.body?.attachments || [],
+      conversation,
+      conversation.workspace_path || currentWorkspace,
+    );
+    activeRuns.get(conversation.id)?.stop?.();
     res.setHeader('Content-Type', 'text/event-stream');
     const userMessage = { id: `msg-${randomUUID()}`, role: 'user', content: req.body.message || '', created_at: nowIso(), attachments: req.body.attachments || [] };
     conversation.messages.push(userMessage);
     if ((!conversation.title || conversation.title === 'New Chat') && userMessage.content) conversation.title = userMessage.content.slice(0, 50);
     conversation.updated_at = nowIso();
     saveState();
-    const run = { buffer: [], emitter: new EventEmitter(), stop: () => {}, fullText: '' };
+    const runId = `run-${randomUUID()}`;
+    const run = {
+      id: runId,
+      buffer: [],
+      emitter: new EventEmitter(),
+      stop: () => {},
+      fullText: '',
+      decidePermission: null,
+      pendingPermissions: new Map(),
+      resolvePermission: null,
+    };
+    const write = (payload) => { const line = `data: ${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n\n`; run.buffer.push(line); run.emitter.emit('line', line); res.write(line); };
+    const clearPendingPermission = (permissionRequestId) => {
+      const normalizedRequestId = String(permissionRequestId || '').trim();
+      if (!normalizedRequestId) return null;
+      const entry = run.pendingPermissions.get(normalizedRequestId);
+      if (entry?.timeout) clearTimeout(entry.timeout);
+      run.pendingPermissions.delete(normalizedRequestId);
+      return entry || null;
+    };
+    const closePendingPermissions = (decision, reason, decidedBy = 'host') => {
+      Array.from(run.pendingPermissions.values()).forEach((entry) => {
+        clearPendingPermission(entry.request.permission_request_id);
+        write({
+          type: 'permission_resolved',
+          conversation_id: conversation.id,
+          permission_request_id: entry.request.permission_request_id,
+          decision: normalizePermissionDecision(decision),
+          decided_by: decidedBy,
+          reason: String(reason || '').trim(),
+          metadata: entry.request.metadata || null,
+        });
+      });
+    };
+    const finalizeRun = () => {
+      if (activeRuns.get(conversation.id)?.id === runId) activeRuns.delete(conversation.id);
+    };
+    const schedulePermissionTimeout = (requestPayload) => setTimeout(() => {
+      void run.resolvePermission?.({
+        permissionRequestId: requestPayload.permission_request_id,
+        decision: 'abort',
+        reason: 'Desktop permission request timed out.',
+        decidedBy: 'host',
+      }).catch((error) => {
+        debugLog(`permission timeout resolve failed for ${requestPayload.permission_request_id}: ${error?.message || error}`);
+      });
+    }, Math.max(1000, Number(requestPayload.timeout_ms || 0) || PERMISSION_REQUEST_TIMEOUT_MS));
     activeRuns.set(conversation.id, run);
     const onText = (text) => { run.fullText += text; write({ type: 'content_block_delta', delta: { type: 'text_delta', text } }); };
-    const onDone = (fullText) => { conversation.messages.push({ id: `msg-${randomUUID()}`, role: 'assistant', content: fullText || run.fullText || '[模型未返回文本]', created_at: nowIso(), attachments: [] }); conversation.updated_at = nowIso(); saveState(); write({ type: 'message_stop' }); write('[DONE]'); res.end(); activeRuns.delete(conversation.id); };
-    const onError = (error) => { write({ type: 'error', error: error || 'Request failed' }); write('[DONE]'); res.end(); activeRuns.delete(conversation.id); };
+    const onDone = (fullText) => { conversation.messages.push({ id: `msg-${randomUUID()}`, role: 'assistant', content: fullText || run.fullText || '[模型未返回文本]', created_at: nowIso(), attachments: [] }); conversation.updated_at = nowIso(); saveState(); write({ type: 'message_stop' }); write('[DONE]'); res.end(); if (activeRuns.get(conversation.id)?.id === runId) activeRuns.delete(conversation.id); };
+    const onError = (error) => { write({ type: 'error', error: error || 'Request failed' }); write('[DONE]'); res.end(); if (activeRuns.get(conversation.id)?.id === runId) activeRuns.delete(conversation.id); };
     const onStart = (controller) => { run.stop = controller.stop; if (controller.sessionId) conversation.backend_session_id = controller.sessionId; };
-    const isCoworkSession = normalizeSessionKind(conversation.session_kind) === 'cowork';
-    if (isCoworkSession || provider.format !== 'openai') {
-      runViaKernel({
-        conversation,
-        provider,
-        prompt: req.body.message || '',
-        attachments: req.body.attachments || [],
-        workspacePath: conversation.workspace_path || currentWorkspace,
-        onText,
-        onDone,
-        onError,
-        onStart,
+    const finishRun = (fullText) => {
+      closePendingPermissions('abort', 'Turn finished before permission request was resolved.');
+      conversation.messages.push({ id: `msg-${randomUUID()}`, role: 'assistant', content: fullText || run.fullText || '[模型未返回文本]', created_at: nowIso(), attachments: [] });
+      conversation.updated_at = nowIso();
+      saveState();
+      write({ type: 'message_stop' });
+      write('[DONE]');
+      res.end();
+      finalizeRun();
+    };
+    const failRun = (error) => {
+      closePendingPermissions('abort', 'Run ended before permission request was resolved.');
+      write({ type: 'error', error: error || 'Request failed' });
+      write('[DONE]');
+      res.end();
+      finalizeRun();
+    };
+    run.resolvePermission = async ({ permissionRequestId, decision, reason = '', decidedBy = 'host' }) => {
+      const normalizedRequestId = String(permissionRequestId || '').trim();
+      if (!normalizedRequestId) {
+        const error = new Error('Permission request id is required');
+        error.statusCode = 400;
+        throw error;
+      }
+      if (typeof run.decidePermission !== 'function') {
+        const error = new Error('Permission broker unavailable');
+        error.statusCode = 409;
+        throw error;
+      }
+      const entry = run.pendingPermissions.get(normalizedRequestId) || null;
+      if (entry?.timeout) {
+        clearTimeout(entry.timeout);
+      } else {
+        debugLog(`resolvePermission proceeding without local pending entry ${conversation.id}: request=${normalizedRequestId}`);
+      }
+      debugLog(`resolvePermission start ${conversation.id}: request=${normalizedRequestId} decision=${decision}`);
+      void Promise.resolve(run.decidePermission({
+        permissionRequestId: normalizedRequestId,
+        decision: normalizePermissionDecision(decision),
+        reason,
+        decidedBy: normalizePermissionDecisionSource(decidedBy),
+      })).then(() => {
+        debugLog(`resolvePermission done ${conversation.id}: request=${normalizedRequestId}`);
+      }).catch((error) => {
+        if (entry) {
+          entry.timeout = schedulePermissionTimeout(entry.request);
+        }
+        if (isKernelRuntimeTransportError(error)) {
+          void resetKernelRuntime('desktop_permission_resolution_failed');
+        }
+        debugLog(`resolvePermission failed ${conversation.id}: request=${normalizedRequestId} message=${error?.message || error}`);
       });
-    } else if (provider.format === 'openai') {
-      runViaOpenAI({ provider, prompt: req.body.message || '', onText, onDone, onError, onStart });
-    }
+    };
+    const startRun = (controller) => {
+      run.stop = controller.stop;
+      run.decidePermission = controller.decidePermission || null;
+      if (controller.sessionId) conversation.backend_session_id = controller.sessionId;
+    };
+    const forwardPermissionRequest = (payload) => {
+      if (!payload?.permission_request_id) return;
+      clearPendingPermission(payload.permission_request_id);
+      run.pendingPermissions.set(payload.permission_request_id, {
+        request: payload,
+        timeout: schedulePermissionTimeout(payload),
+      });
+      write({ type: 'permission_request', conversation_id: conversation.id, ...payload });
+    };
+    const forwardPermissionResolved = (payload) => {
+      if (!payload?.permission_request_id) return;
+      clearPendingPermission(payload.permission_request_id);
+      write({ type: 'permission_resolved', conversation_id: conversation.id, ...payload });
+    };
+    runViaKernel({
+      conversation,
+      provider,
+      prompt: req.body.message || '',
+      attachments: runtimeAttachments,
+      workspacePath: conversation.workspace_path || currentWorkspace,
+      onText,
+      onDone: finishRun,
+      onError: failRun,
+      onStart: startRun,
+      onPermissionRequest: forwardPermissionRequest,
+      onPermissionResolved: forwardPermissionResolved,
+    });
     req.on('aborted', () => {
-      if (!res.writableEnded) activeRuns.get(conversation.id)?.stop();
+      if (!res.writableEnded) run.stop();
     });
   });
 
@@ -1912,6 +2351,9 @@ app.whenReady().then(async () => {
   debugLog('window created');
 });
 
+app.on('before-quit', () => {
+  void resetKernelRuntime('desktop_app_quit');
+});
 app.on('window-all-closed', () => { if (apiServer) apiServer.close(); if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 

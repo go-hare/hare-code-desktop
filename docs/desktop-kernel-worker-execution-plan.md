@@ -35,6 +35,23 @@ flowchart LR
 
 本执行文档以 `claude-code` commit `eeb0cb3 feat(kernel): 补齐 provider override contract` 为前置基线。
 
+截至 2026 年 4 月 30 日，当前工作区中的 `claude-code` 已补齐 provider override contract，并已在 package-level `kernel.js` public surface 暴露 `createKernelRuntimeInProcessTurnExecutor()`；`hare-code-desktop` 主路径已经切到 worker/runtime，`electron/worker.cjs` 不再保留兼容 fallback。另一个已确认的打包面要求是：同步 vendor `kernel.js` 时，还要同步它的 runtime package dependencies 到 `electron/vendor/hare-code-kernel/node_modules`，否则 Node/Electron Main 在 release / vendor 路径下无法稳定 import `kernel.js`。
+
+### 2.1 状态快照
+
+- 已完成前置：
+  - `claude-code` 已补齐 provider override contract。
+  - `claude-code` 已补齐 `createKernelRuntimeInProcessTurnExecutor()` public export。
+  - `hare-code-desktop` 已新增 `electron/worker.cjs`。
+  - `hare-code-desktop/electron/main.cjs` 已切到 stdio `KernelRuntime` singleton。
+  - `/api/chat` 已统一收口到 `kernelConversation.runTurn()`。
+  - 旧 `runViaOpenAI()` 与桌面侧 CLI args/env helper 已删除。
+  - `electron/worker.cjs` 已只走 public in-process executor，不再保留 headless CLI fallback。
+  - `scripts/sync-hare-sdk.cjs` 已同步 vendor `dist`，并补齐 vendor runtime `node_modules`（当前实测至少包含 `ws`）。
+- 仍待完成：
+  - 仍需补跑完整 Desktop build / 桌面手测。
+  - 当前本机 `bun run build` 仍因 `vite` 缺失失败，需要单独补环境或改用项目既有安装方式验证。
+
 已经具备的 kernel contract：
 
 - `RuntimeProviderSelection`
@@ -44,13 +61,11 @@ flowchart LR
 - `KernelRuntimeWireTurnExecutionContext.providerSelection`
 - provider 解析顺序：`providerOverride > conversation provider > runtime default`
 
-仍待接入的实现：
+当前剩余工作：
 
-- kernel 侧 in-process turn executor。
-- desktop `worker.cjs`。
-- Electron Main 改为通过 Worker stdio transport 创建 `KernelRuntime`。
-- desktop provider state 到 `RuntimeProviderSelection` 的映射。
-- `KernelEvent` 到现有 SSE 事件的映射。
+- 补跑 Desktop UI 手测，确认多轮对话、stop / reconnect / delete 在真实界面上的行为。
+- 在本机补齐 `vite` 相关环境后重跑 Desktop build。
+- 如后续需要 release 路径验证，确认 `electron-builder` 打包结果包含 `worker.cjs`、vendor `dist` 与 vendor `node_modules`。
 
 ## 3. 非目标
 
@@ -98,7 +113,7 @@ Worker 文件建议为：
 Worker 只做三件事：
 
 1. resolve 并 import `kernel.js`。
-2. 创建 in-process turn executor。
+2. 优先创建 in-process turn executor；若当前本地 package export 缺失，则临时回退到兼容 headless CLI executor。
 3. 启动 `runKernelRuntimeWireProtocol()`。
 
 示意代码：
@@ -377,8 +392,9 @@ Main 的 mapper 只消费 public `KernelEvent` / `KernelRuntimeEnvelope`：
 ### 视情况改
 
 - `scripts/sync-hare-sdk.cjs`
-  - 当前脚本已经同步整套 `dist` 到 `electron/vendor/hare-code-kernel/dist`。
-  - 如果 `worker.cjs` 需要随发布打包，确认 electron-builder 包含它和 vendor dist。
+  - 当前脚本已同步整套 `dist` 到 `electron/vendor/hare-code-kernel/dist`。
+  - 当前脚本还需要同步 vendor runtime package dependencies 到 `electron/vendor/hare-code-kernel/node_modules`，否则 Node / Electron Main 在 vendor 路径下无法稳定 import `kernel.js`。
+  - 如果 `worker.cjs` 需要随发布打包，确认 electron-builder 包含它、vendor dist 与 vendor `node_modules`。
 
 - `README.md`
   - 更新本地开发说明：桌面端运行依赖 `kernel.js` + `worker.cjs`，不再依赖旧 SDK bundle。
@@ -389,6 +405,8 @@ Main 的 mapper 只消费 public `KernelEvent` / `KernelRuntimeEnvelope`：
 ## 9. 验证计划
 
 ### Kernel 前置验证
+
+当前工作区默认视为这组前置已经完成；如果后续继续改 `claude-code` 的 executor、wire surface 或 package export，仍然要回归这组验证。
 
 在 `../claude-code`：
 
@@ -405,6 +423,16 @@ bun test src/kernel/__tests__/surface.test.ts tests/integration/kernel-package-s
 ```bash
 bun run kernel:build
 bun run build
+node -c electron/main.cjs
+node -c electron/worker.cjs
+```
+
+建议增加的 smoke：
+
+```bash
+# 1. Node 直接 import vendor kernel.js，确认 packaged / vendor 路径可解析
+# 2. createKernelRuntime({ transportConfig: stdio }) -> createConversation() -> dispose()
+# 3. 本地失败 provider turn smoke，确认 turn 能返回终态，不会卡死在 worker 内
 ```
 
 ### Worker smoke
@@ -428,6 +456,7 @@ bun run build
 - 生成中 stop，只停止当前 conversation。
 - 生成中刷新/重连，确认 `/reconnect` 能 replay 已缓存 SSE。
 - 删除 conversation，确认 Worker/runtime conversation 被 dispose。
+- 触发 permission request 时，未接 UI 前必须显式失败或走 broker，不能静默通过。
 - Worker crash 后下一轮请求能返回明确错误或重建 Worker，不能静默卡住。
 
 ## 10. 验收标准
@@ -458,15 +487,15 @@ bun run build
 
 ## 11. 执行顺序
 
-1. 在 `claude-code` 补并验证 `createKernelRuntimeInProcessTurnExecutor()`。
-2. 在 `claude-code` 导出该 executor 到 `@go-hare/hare-code/kernel`。
-3. 在 `hare-code-desktop` 新增 `electron/worker.cjs`。
-4. 在 `electron/main.cjs` 接入 stdio `KernelRuntime`。
-5. 接入 desktop provider -> `RuntimeProviderSelection` mapper。
-6. 改造 `/api/chat` 到 `kernelConversation.runTurn()`。
-7. 改造 stop/delete/reconnect。
-8. 删除旧 CLI/OpenAI direct path。
-9. 跑 Kernel 前置验证、Desktop build、Worker smoke、Desktop 手测。
+1. 确认 `hare-code-desktop` 当前使用的 `kernel.js` 来源，并在需要时执行 `bun run kernel:build` 同步 vendor dist 与 vendor runtime deps。
+2. 已完成：新增 `electron/worker.cjs`。
+3. 已完成：在 `electron/main.cjs` 接入 stdio `KernelRuntime` singleton。
+4. 已完成：在 `electron/main.cjs` 增加 `kernelConversations` registry 与 desktop provider -> `RuntimeProviderSelection` mapper。
+5. 已完成：改造 `/api/chat` 到统一 `kernelConversation.runTurn()`，并为每 turn 传 `providerOverride`。
+6. 已完成：改造 stop/delete/reconnect 到 runtime conversation 生命周期。
+7. 已完成：删除旧 CLI/OpenAI direct path。
+8. 已完成：`claude-code` package export 与 `electron/worker.cjs` 已去掉兼容 fallback。
+9. 剩余：跑 Desktop build、Worker smoke、Desktop 手测；如本轮改动继续波及 `claude-code`，再补跑 Kernel 前置验证。
 
 ## 12. 当前下一刀
 
@@ -474,7 +503,7 @@ bun run build
 
 下一刀是：
 
-1. `claude-code`: 实现并导出 `createKernelRuntimeInProcessTurnExecutor()`。
-2. `hare-code-desktop`: 新增 `electron/worker.cjs`，让 Worker 直接启动 `runKernelRuntimeWireProtocol()`。
-3. `hare-code-desktop`: 把 `electron/main.cjs` 的 `runViaKernel()` 从 CLI spawn 改成 `createKernelRuntime({ transportConfig: stdio worker })`。
+1. `hare-code-desktop`: 在本机补齐 `vite` 相关环境，跑通 `bun run build`。
+2. `hare-code-desktop`: 做桌面 UI 手测，确认多轮 turn、stop-generation、reconnect、delete 会话都还正常。
+3. 若要做 release 验证：检查 electron-builder 产物中 `worker.cjs`、vendor `dist`、vendor `node_modules` 是否完整带上。
 

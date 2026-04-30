@@ -660,6 +660,22 @@ export async function answerUserQuestion(
   return res.json();
 }
 
+export async function decidePermissionRequest(
+  conversationId: string,
+  permissionRequestId: string,
+  decision: 'allow_once' | 'allow_session' | 'deny' | 'abort',
+  reason?: string
+): Promise<{ ok: boolean }> {
+  const res = await request(`/conversations/${conversationId}/permissions/${permissionRequestId}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      decision,
+      reason,
+    }),
+  });
+  return res.json();
+}
+
 // Pre-warm engine for a conversation (spawn in background before user sends first message)
 export function warmEngine(conversationId: string): void {
   const userMode = getUserModeForConversation(conversationId);
@@ -789,6 +805,12 @@ export function reconnectStream(
             }
             if (parsed.type === 'ask_user' && onSystem) {
               onSystem('ask_user', '', parsed);
+            }
+            if (parsed.type === 'permission_request' && onSystem) {
+              onSystem('permission_request', '', parsed);
+            }
+            if (parsed.type === 'permission_resolved' && onSystem) {
+              onSystem('permission_resolved', '', parsed);
             }
             if (parsed.type === 'control_request_resolved' && onSystem) {
               onSystem('control_request_resolved', '', parsed);
@@ -1388,6 +1410,20 @@ export async function sendMessage(
           if (parsed.type === 'ask_user') {
             if (onSystem) {
               onSystem('ask_user', '', parsed);
+            }
+            continue;
+          }
+
+          if (parsed.type === 'permission_request') {
+            if (onSystem) {
+              onSystem('permission_request', '', parsed);
+            }
+            continue;
+          }
+
+          if (parsed.type === 'permission_resolved') {
+            if (onSystem) {
+              onSystem('permission_resolved', '', parsed);
             }
             continue;
           }

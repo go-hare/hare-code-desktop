@@ -3,7 +3,7 @@ import { ChevronDown, FileText, ArrowUp, RotateCcw, Pencil, Copy, Check, Papercl
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconPencil, IconProjects, IconResearch, IconWebSearch } from './Icons';
 import ClaudeLogo from './ClaudeLogo';
-import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, uploadFile, deleteAttachment, compactConversation, answerUserQuestion, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels, getStreamStatus, reconnectStream, getProviderModels, getSkills, warmEngine, getProjects, createProject, Project, materializeGithub, getProviders, Provider } from '../api';
+import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, uploadFile, deleteAttachment, compactConversation, answerUserQuestion, decidePermissionRequest, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels, getStreamStatus, reconnectStream, getProviderModels, getSkills, warmEngine, getProjects, createProject, Project, materializeGithub, getProviders, Provider } from '../api';
 import { addStreaming, removeStreaming, isStreaming } from '../streamingState';
 import MarkdownRenderer from './MarkdownRenderer';
 import ResearchPanel from './ResearchPanel';
@@ -1352,6 +1352,19 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     questions: Array<{ question: string; header?: string; options?: Array<string | { label: string; description?: string }>; multiSelect?: boolean }>;
     answers: Record<string, string>;
   } | null>(null);
+  type PermissionDialogState = {
+    conversation_id: string;
+    permission_request_id: string;
+    tool_name: string;
+    action: string;
+    risk: string;
+    arguments_preview?: any;
+    policy_snapshot?: any;
+    isSubmitting: boolean;
+    submitError: string | null;
+  };
+  const [permissionDialogs, setPermissionDialogs] = useState<PermissionDialogState[]>([]);
+  const permissionDialog = permissionDialogs[0] ?? null;
 
   const submitAskUserDialogAnswers = useCallback(async (dialog: NonNullable<typeof askUserDialog>, answers: Record<string, string>) => {
     if (!activeId) return;
@@ -1362,6 +1375,56 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       console.error('Failed to send answer:', err);
     }
   }, [activeId]);
+  const closePermissionDialogForConversation = useCallback((conversationId: string) => {
+    setPermissionDialogs(prev => prev.filter(item => item.conversation_id !== conversationId));
+  }, []);
+  const handlePermissionSystemEvent = useCallback((event: string, data: any, conversationId: string) => {
+    if (event === 'permission_request' && data) {
+      const nextDialog: PermissionDialogState = {
+        conversation_id: String(data.conversation_id || conversationId || ''),
+        permission_request_id: String(data.permission_request_id || ''),
+        tool_name: String(data.tool_name || ''),
+        action: String(data.action || ''),
+        risk: String(data.risk || '').toLowerCase(),
+        arguments_preview: data.arguments_preview,
+        policy_snapshot: data.policy_snapshot,
+        isSubmitting: false,
+        submitError: null,
+      };
+      setPermissionDialogs(prev => {
+        const existingIndex = prev.findIndex(item => item.permission_request_id === nextDialog.permission_request_id);
+        if (existingIndex >= 0) {
+          return prev.map((item, index) => index === existingIndex ? { ...item, ...nextDialog } : item);
+        }
+        return [...prev, nextDialog];
+      });
+      return true;
+    }
+    if (event === 'permission_resolved' && data) {
+      setPermissionDialogs(prev => prev.filter(item => item.permission_request_id !== data.permission_request_id));
+      return true;
+    }
+    return false;
+  }, []);
+  const submitPermissionDecision = useCallback(async (
+    dialog: PermissionDialogState,
+    decision: 'allow_once' | 'allow_session' | 'deny' | 'abort'
+  ) => {
+    setPermissionDialogs(prev => prev.map(item => item.permission_request_id === dialog.permission_request_id
+      ? { ...item, isSubmitting: true, submitError: null }
+      : item));
+    try {
+      const reason = decision === 'deny'
+        ? 'Denied from desktop permission dialog.'
+        : 'Approved from desktop permission dialog.';
+      await decidePermissionRequest(dialog.conversation_id, dialog.permission_request_id, decision, reason);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err || 'Failed to submit permission decision');
+      setPermissionDialogs(prev => prev.map(item => item.permission_request_id === dialog.permission_request_id
+        ? { ...item, isSubmitting: false, submitError: message }
+        : item));
+    }
+  }, []);
 
   // Task/Agent progress state
   const [activeTasks, setActiveTasks] = useState<Map<string, { description: string; status?: string; summary?: string; last_tool_name?: string }>>(new Map());
@@ -1735,6 +1798,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 messagesBufferRef.current.delete(convId);
                 if (viewingIdRef.current === convId) setLoading(false);
                 abortControllerRef.current = null;
+                closePermissionDialogForConversation(convId);
                 setMessagesFor(convId, prev => {
                   const newMsgs = [...prev];
                   const lastMsg = newMsgs[newMsgs.length - 1];
@@ -1747,6 +1811,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 messagesBufferRef.current.delete(convId);
                 if (viewingIdRef.current === convId) setLoading(false);
                 abortControllerRef.current = null;
+                closePermissionDialogForConversation(convId);
               },
               (thinkingDelta, thinkingFull) => {
                 setMessagesFor(convId, prev => {
@@ -1757,6 +1822,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 });
               },
               (event, message, data) => {
+                if (handlePermissionSystemEvent(event, data, convId)) {
+                  return;
+                }
                 if (event === 'ask_user' && data) {
                   setAskUserDialog({ request_id: data.request_id, tool_use_id: data.tool_use_id, questions: data.questions || [], answers: {} });
                 }
@@ -2421,6 +2489,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         abortControllerRef.current = null;
         isCreatingRef.current = false; // Reset flag
         clearStreamSession(conversationId!, streamRequestId);
+        closePermissionDialogForConversation(conversationId!);
         setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
@@ -2466,6 +2535,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         abortControllerRef.current = null;
         isCreatingRef.current = false;
         clearStreamSession(conversationId!, streamRequestId);
+        closePermissionDialogForConversation(conversationId!);
         setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
@@ -2490,6 +2560,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (event, message, data) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
+        if (handlePermissionSystemEvent(event, data, conversationId!)) {
+          return;
+        }
         // Handle metadata (update user message ID)
         if (event === 'metadata' && data && data.user_message_id) {
           setMessages(prev => {
@@ -2934,6 +3007,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         if (viewingIdRef.current === conversationId) setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
+        closePermissionDialogForConversation(conversationId);
         setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
@@ -2952,6 +3026,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
+        closePermissionDialogForConversation(conversationId);
         setMessages(prev => {
           const newMsgs = [...prev];
           if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
@@ -2976,6 +3051,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (event, message, data) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        if (handlePermissionSystemEvent(event, data, conversationId)) {
+          return;
+        }
         if (event === 'metadata' && data && data.user_message_id) {
           setMessagesFor(conversationId, prev => {
             const newMsgs = [...prev];
@@ -3136,6 +3214,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         if (viewingIdRef.current === conversationId) setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
+        closePermissionDialogForConversation(conversationId);
         setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
@@ -3154,6 +3233,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
+        closePermissionDialogForConversation(conversationId);
         setMessages(prev => {
           const newMsgs = [...prev];
           if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
@@ -3178,6 +3258,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (event, message, data) => {
         if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        if (handlePermissionSystemEvent(event, data, conversationId)) {
+          return;
+        }
         if (event === 'metadata' && data && data.user_message_id) {
           setMessagesFor(conversationId, prev => {
             const newMsgs = [...prev];
@@ -4249,6 +4332,66 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
               <span className="truncate">{task.last_tool_name ? `${task.description} (${task.last_tool_name})` : task.description}</span>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Permission request dialog */}
+      {permissionDialog && (
+        <div className="fixed inset-0 z-[210] flex items-center justify-center bg-black/40">
+          <div className="bg-claude-bg border border-claude-border rounded-2xl shadow-xl w-[560px] max-w-[calc(100vw-32px)] max-h-[80vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="px-5 pt-5 pb-3">
+              <h3 className="text-[15px] font-semibold text-claude-text mb-1">Permission required</h3>
+              <div className="text-[13px] text-claude-textSecondary leading-6">
+                <span className="font-medium text-claude-text">{permissionDialog.tool_name || 'Tool'}</span>
+                {permissionDialog.action ? ` wants to ${permissionDialog.action}.` : ' needs approval to continue.'}
+              </div>
+              {permissionDialogs.length > 1 && (
+                <div className="mt-2 text-[12px] text-claude-textSecondary">
+                  Pending requests: {permissionDialogs.length}
+                </div>
+              )}
+            </div>
+            <div className="px-5 pb-4 flex flex-col gap-3">
+              <div className="flex items-center gap-2 text-[12px] text-claude-textSecondary">
+                <span className="font-medium text-claude-text">Risk</span>
+                <span className={`inline-flex items-center rounded-full px-2 py-0.5 border ${permissionDialog.risk === 'high' ? 'border-red-300 text-red-700 bg-red-50' : permissionDialog.risk === 'medium' ? 'border-amber-300 text-amber-700 bg-amber-50' : 'border-emerald-300 text-emerald-700 bg-emerald-50'}`}>
+                  {permissionDialog.risk || 'unknown'}
+                </span>
+              </div>
+              {permissionDialog.arguments_preview != null && (
+                <div className="flex flex-col gap-1">
+                  <div className="text-[12px] font-medium text-claude-textSecondary">Request</div>
+                  <pre className="text-[12px] leading-5 whitespace-pre-wrap break-all bg-claude-input border border-claude-border rounded-xl px-3 py-2 text-claude-textSecondary overflow-x-auto">{typeof permissionDialog.arguments_preview === 'string' ? permissionDialog.arguments_preview : JSON.stringify(permissionDialog.arguments_preview, null, 2)}</pre>
+                </div>
+              )}
+              {permissionDialog.submitError && (
+                <div className="text-[12px] text-red-600">{permissionDialog.submitError}</div>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 px-5 pb-5">
+              <button
+                onClick={() => void submitPermissionDecision(permissionDialog, 'deny')}
+                disabled={permissionDialog.isSubmitting}
+                className="px-4 py-1.5 text-[13px] border border-claude-border text-claude-textSecondary hover:bg-claude-hover rounded-lg transition-colors disabled:opacity-50"
+              >
+                Deny
+              </button>
+              <button
+                onClick={() => void submitPermissionDecision(permissionDialog, 'allow_once')}
+                disabled={permissionDialog.isSubmitting}
+                className="px-4 py-1.5 text-[13px] border border-claude-border text-claude-text hover:bg-claude-hover rounded-lg transition-colors disabled:opacity-50"
+              >
+                Allow once
+              </button>
+              <button
+                onClick={() => void submitPermissionDecision(permissionDialog, 'allow_session')}
+                disabled={permissionDialog.isSubmitting}
+                className="px-4 py-1.5 text-[13px] text-white bg-[#C6613F] hover:bg-[#D97757] rounded-lg transition-colors font-medium disabled:opacity-50"
+              >
+                {permissionDialog.isSubmitting ? 'Submitting...' : 'Allow for chat'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

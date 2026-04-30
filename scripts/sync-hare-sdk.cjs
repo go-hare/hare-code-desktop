@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { createWriteStream } = require('fs');
+const { builtinModules } = require('module');
 
 const desktopRoot = path.resolve(__dirname, '..');
 const workspaceRoot = path.resolve(desktopRoot, '..');
@@ -15,6 +16,9 @@ const defaultReleaseRepo = process.env.HARE_CODE_RELEASE_REPO || 'go-hare/hare-c
 const bunBinary = process.platform === 'win32' ? 'bun.exe' : 'bun';
 const npmBinary = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const tarBinary = 'tar';
+const builtinSpecifierSet = new Set(
+  builtinModules.map((specifier) => specifier.replace(/^node:/, '')),
+);
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -90,7 +94,93 @@ function run(command, args, options = {}) {
   return result;
 }
 
-function syncKernelDist(sourceDist, label) {
+function isBuiltinSpecifier(specifier) {
+  const normalized = String(specifier || '').replace(/^node:/, '');
+  if (!normalized) return true;
+  if (builtinSpecifierSet.has(normalized)) return true;
+  if (normalized.startsWith('@')) return false;
+  const baseName = normalized.split('/')[0];
+  return builtinSpecifierSet.has(baseName);
+}
+
+function normalizePackageName(specifier) {
+  if (specifier.startsWith('@')) {
+    const [scope, name] = specifier.split('/');
+    return scope && name ? `${scope}/${name}` : '';
+  }
+  return specifier.split('/')[0] || '';
+}
+
+function collectKernelRuntimeDependencyNames(sourceDist) {
+  const importPattern =
+    /(?:^|[;\n\r])\s*(?:import|export)\s+(?:[^'";]*?\s+from\s+)?['"]([^'".\/][^'"]*)['"]/gm;
+  const dependencyNames = new Set();
+  const distFiles = fs.readdirSync(sourceDist).filter((entry) => entry.endsWith('.js'));
+
+  for (const fileName of distFiles) {
+    const filePath = path.resolve(sourceDist, fileName);
+    const source = fs.readFileSync(filePath, 'utf8');
+    let match = importPattern.exec(source);
+    while (match) {
+      const specifier = match[1];
+      if (!isBuiltinSpecifier(specifier)) {
+        const packageName = normalizePackageName(specifier);
+        if (/^(?:@[^/]+\/[^/]+|[a-zA-Z0-9][\w.-]*)$/.test(packageName)) {
+          dependencyNames.add(packageName);
+        }
+      }
+      match = importPattern.exec(source);
+    }
+  }
+
+  return Array.from(dependencyNames).sort();
+}
+
+function resolveRuntimeDependencySpecs(sourcePackageRoot, dependencyNames) {
+  const sourcePackageJson = readJson(path.resolve(sourcePackageRoot, 'package.json'));
+  const versionMap = {
+    ...(sourcePackageJson.dependencies || {}),
+    ...(sourcePackageJson.optionalDependencies || {}),
+    ...(sourcePackageJson.devDependencies || {}),
+    ...(sourcePackageJson.peerDependencies || {}),
+  };
+
+  return dependencyNames.map((packageName) => {
+    const version = versionMap[packageName];
+    if (!version) {
+      console.error(`Unable to resolve runtime dependency version for ${packageName}`);
+      process.exit(1);
+    }
+    return `${packageName}@${version}`;
+  });
+}
+
+function installKernelRuntimeDependencies(sourceDist, sourcePackageRoot) {
+  const dependencyNames = collectKernelRuntimeDependencyNames(sourceDist);
+  const targetNodeModules = path.resolve(targetKernelRoot, 'node_modules');
+  fs.rmSync(targetNodeModules, { recursive: true, force: true });
+
+  if (dependencyNames.length === 0) {
+    console.log('Kernel dist has no external runtime package dependencies to sync.');
+    return;
+  }
+
+  const dependencySpecs = resolveRuntimeDependencySpecs(
+    sourcePackageRoot,
+    dependencyNames,
+  );
+  console.log(
+    `Installing hare-code kernel runtime deps into vendor node_modules: ${dependencyNames.join(', ')}`,
+  );
+  run(
+    npmBinary,
+    ['install', '--no-save', '--no-package-lock', '--prefer-offline', ...dependencySpecs],
+    { cwd: targetKernelRoot },
+  );
+  fs.rmSync(path.resolve(targetKernelRoot, 'package-lock.json'), { force: true });
+}
+
+function syncKernelDist(sourceDist, label, sourcePackageRoot) {
   const kernelEntry = path.resolve(sourceDist, 'kernel.js');
   if (!fs.existsSync(kernelEntry)) {
     console.error(`Missing hare-code kernel bundle: ${kernelEntry}`);
@@ -105,6 +195,7 @@ function syncKernelDist(sourceDist, label) {
     `${JSON.stringify({ type: 'module' }, null, 2)}\n`,
     'utf8',
   );
+  installKernelRuntimeDependencies(sourceDist, sourcePackageRoot);
   console.log(`Synced hare-code kernel dist from ${label} -> ${targetKernelDist}`);
 }
 
@@ -215,7 +306,7 @@ async function resolveTarballSource(packageSpec) {
 function syncFromSibling() {
   const sourceDist = path.resolve(hareCodeRoot, 'dist');
   run(bunBinary, ['run', 'build'], { cwd: hareCodeRoot });
-  syncKernelDist(sourceDist, 'sibling source');
+  syncKernelDist(sourceDist, 'sibling source', hareCodeRoot);
 }
 
 async function syncFromPackage(packageSpec) {
@@ -264,7 +355,13 @@ async function syncFromPackage(packageSpec) {
     process.exit(1);
   }
 
-  syncKernelDist(packedDist, tarballSource.mode === 'npm-pack' ? `package spec "${tarballSource.value}"` : `${tarballSource.mode} "${tarballSource.value}"`);
+  syncKernelDist(
+    packedDist,
+    tarballSource.mode === 'npm-pack'
+      ? `package spec "${tarballSource.value}"`
+      : `${tarballSource.mode} "${tarballSource.value}"`,
+    path.resolve(tempDir, 'package'),
+  );
   if (tarballSource.mode === 'npm-pack') {
     console.log(`Resolved hare-code package spec "${tarballSource.value}"`);
   } else {
