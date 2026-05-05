@@ -1,7 +1,7 @@
 {
   "name": "hare-desktop",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.7.3",
   "description": "hare donor-style desktop frontend",
   "author": {
     "name": "pretend1111",
@@ -14,8 +14,9 @@
     "kernel:build:package": "node ./scripts/sync-hare-sdk.cjs --source=package",
     "sdk:build": "bun run kernel:build",
     "sdk:build:package": "bun run kernel:build:package",
-    "version:sync": "node ../claude-code/scripts/sync-sibling-version.mjs --only hare-code-desktop",
-    "version:check": "node ../claude-code/scripts/check-sibling-version.mjs --only hare-code-desktop",
+    "version:sync": "node ./scripts/sibling-version.cjs sync",
+    "version:check": "node ./scripts/sibling-version.cjs check",
+    "smoke:subagent:dev": "node ./scripts/dev-subagent-smoke.cjs",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
@@ -40,8 +41,19 @@
       "electron/**/*",
       "node_modules/**/*"
     ],
-    "asarUnpack": [],
-    "extraResources": [],
+    "asarUnpack": [
+      "electron/worker.cjs",
+      "electron/vendor/hare-code-kernel/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "electron/vendor/hare-code-kernel/node_modules",
+        "to": "app.asar.unpacked/electron/vendor/hare-code-kernel/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "win": {
       "target": [
         "nsis"

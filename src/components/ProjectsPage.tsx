@@ -34,7 +34,7 @@ const ProjectsPage = () => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [showPlusMenu, setShowPlusMenu] = useState(false);
   const [showSkillsSubmenu, setShowSkillsSubmenu] = useState(false);
-  const [enabledSkills, setEnabledSkills] = useState<Array<{ id: string; name: string; description?: string }>>([]);
+  const [enabledSkills, setEnabledSkills] = useState<Array<{ id: string; name: string; commandName: string; description?: string }>>([]);
   const [selectedSkill, setSelectedSkill] = useState<{ name: string; slug: string; description?: string } | null>(null);
   const plusMenuRef = useRef<HTMLDivElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
@@ -98,7 +98,12 @@ const ProjectsPage = () => {
     if (!showPlusMenu) { setShowSkillsSubmenu(false); return; }
     getSkills().then((data: any) => {
       const all = [...(data.examples || []), ...(data.my_skills || [])];
-      setEnabledSkills(all.filter((s: any) => s.enabled).map((s: any) => ({ id: s.id, name: s.name, description: s.description })));
+      setEnabledSkills(all.filter((s: any) => s.enabled && s.userInvocable !== false).map((s: any) => ({
+        id: s.id,
+        name: s.display_name || s.name,
+        commandName: s.command_name || s.source_dir || s.name,
+        description: s.description,
+      })));
     }).catch(() => {});
   }, [showPlusMenu]);
 
@@ -349,7 +354,7 @@ const ProjectsPage = () => {
                             {enabledSkills.length > 0 ? enabledSkills.map(skill => (
                               <button key={skill.id} onClick={() => {
                                 setShowPlusMenu(false); setShowSkillsSubmenu(false);
-                                const slug = skill.name.toLowerCase().replace(/\s+/g, '-');
+                                const slug = skill.commandName;
                                 setSelectedSkill({ name: skill.name, slug, description: skill.description });
                                 setMessage(prev => prev ? `/${slug} ${prev}` : `/${slug} `);
                                 textareaRef.current?.focus();

@@ -3,6 +3,153 @@ const GATEWAY_BASE = 'https://api-cn.jiazhuang.cloud';
 const CHENGDU_API = 'https://clawparrot.com/api';
 const isElectronApp = typeof window !== 'undefined' && !!(window as any).electronAPI?.isElectron;
 
+type KernelChatEventEntry = {
+  sequence?: number;
+  line?: string;
+};
+
+type KernelChatEventMessage = {
+  runId?: string | null;
+  conversationId?: string | null;
+  event?: KernelChatEventEntry;
+};
+
+type KernelChatApi = {
+  start: (payload: any) => Promise<{ ok?: boolean; runId?: string | null; conversationId?: string | null }>;
+  status: (conversationId: string) => Promise<{ active: boolean; foregroundActive?: boolean; eventCount: number; runId?: string | null }>;
+  stop: (conversationId: string, options?: any) => Promise<{ ok: boolean }>;
+  replay: (conversationId: string, runId?: string | null) => Promise<{ active: boolean; foregroundActive?: boolean; eventCount: number; runId?: string | null; events?: KernelChatEventEntry[] }>;
+  decidePermission: (conversationId: string, permissionRequestId: string, payload: any) => Promise<{ ok: boolean }>;
+  answer: (conversationId: string, payload: any) => Promise<{ ok: boolean }>;
+  onEvent: (filter: { conversationId?: string; runId?: string | null } | string, callback: (message: KernelChatEventMessage) => void) => () => void;
+};
+
+type KernelChatStream = {
+  reader: ReadableStreamDefaultReader<Uint8Array>;
+  close: () => void;
+  runId: string | null;
+};
+
+function getElectronKernelChatApi(): KernelChatApi {
+  const api = typeof window !== 'undefined' ? (window as any).electronAPI?.kernelChat : null;
+  if (!api) {
+    throw new Error('Electron kernel IPC is required for desktop runtime communication');
+  }
+  return api;
+}
+
+function getRuntimeUserProfile(): any {
+  try {
+    const p = JSON.parse(localStorage.getItem('user_profile') || localStorage.getItem('user') || '{}');
+    const wf = p.work_function;
+    const pp = p.personal_preferences;
+    return (wf || pp) ? { work_function: wf, personal_preferences: pp } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildKernelChatPayload(conversationId: string, message: string, attachments?: any[] | null) {
+  return {
+    conversation_id: conversationId,
+    message,
+    attachments: attachments || undefined,
+    env_token: localStorage.getItem('CUSTOM_API_KEY') || localStorage.getItem('ANTHROPIC_API_KEY') || undefined,
+    env_base_url: localStorage.getItem('CUSTOM_BASE_URL') || localStorage.getItem('ANTHROPIC_BASE_URL') || undefined,
+    user_mode: getUserModeForConversation(conversationId),
+    user_profile: getRuntimeUserProfile(),
+  };
+}
+
+async function openKernelChatStream(
+  conversationId: string,
+  signal?: AbortSignal,
+  startPayload?: any,
+  initialRunId?: string | null
+): Promise<KernelChatStream> {
+  const api = getElectronKernelChatApi();
+  const encoder = new TextEncoder();
+  const seen = new Set<string>();
+  let runId: string | null = initialRunId || null;
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let replaying = true;
+  const pendingLiveEvents: Array<{ entry?: KernelChatEventEntry; eventRunId?: string | null }> = [];
+  let closed = false;
+
+  const cleanup = () => {
+    if (unsubscribe) {
+      unsubscribe();
+      unsubscribe = null;
+    }
+    signal?.removeEventListener('abort', close);
+  };
+
+  function close() {
+    if (closed) return;
+    closed = true;
+    cleanup();
+    try {
+      controllerRef?.close();
+    } catch {}
+  }
+
+  const enqueue = (entry?: KernelChatEventEntry, eventRunId?: string | null) => {
+    if (closed || !entry?.line || !controllerRef) return;
+    if (runId && eventRunId && eventRunId !== runId) return;
+    const key = entry.sequence != null
+      ? `${eventRunId || runId || conversationId}:${entry.sequence}`
+      : `${eventRunId || runId || conversationId}:${entry.line}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    controllerRef.enqueue(encoder.encode(entry.line));
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef = controller;
+    },
+    cancel() {
+      close();
+    },
+  });
+
+  if (signal?.aborted) {
+    close();
+    return { reader: stream.getReader(), close, runId };
+  }
+  signal?.addEventListener('abort', close, { once: true });
+
+  unsubscribe = api.onEvent({ conversationId }, (message) => {
+    const eventRunId = message?.runId || null;
+    if (!runId || eventRunId !== runId) return;
+    if (replaying) {
+      pendingLiveEvents.push({ entry: message?.event, eventRunId });
+      return;
+    }
+    enqueue(message?.event, eventRunId);
+  });
+
+  try {
+    if (startPayload) {
+      const started = await api.start(startPayload);
+      runId = started?.runId || null;
+    }
+    const replay = await api.replay(conversationId, runId || undefined);
+    runId = replay?.runId || runId || null;
+    (replay?.events || []).forEach((event) => enqueue(event, runId));
+    replaying = false;
+    pendingLiveEvents
+      .sort((left, right) => Number(left.entry?.sequence || 0) - Number(right.entry?.sequence || 0))
+      .forEach(({ entry, eventRunId }) => enqueue(entry, eventRunId));
+    pendingLiveEvents.length = 0;
+    return { reader: stream.getReader(), close, runId };
+  } catch (error) {
+    close();
+    throw error;
+  }
+}
+
 export function buildApiUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   return `${API_BASE}${normalizedPath}`;
@@ -586,7 +733,7 @@ export async function deleteConversation(id: string) {
 
   // 最佳努力：先请求后端停止生成（即使失败也不阻塞删除）
   try {
-    await request(`/conversations/${id}/stop-generation`, { method: 'POST' });
+    await stopGeneration(id);
   } catch { }
 
   try {
@@ -614,14 +761,20 @@ export async function updateConversation(id: string, data: any) {
 
 // 查询对话的活跃生成状态
 export async function getGenerationStatus(conversationId: string) {
-  const res = await request(`/conversations/${conversationId}/generation-status`);
-  return res.json();
+  const status = await getElectronKernelChatApi().status(conversationId);
+  return {
+    active: Boolean(status.foregroundActive),
+    status: status.foregroundActive ? 'generating' : 'idle',
+    crossProcess: true,
+    runId: status.runId || null,
+    text: status.text || '',
+    toolCalls: Array.isArray(status.toolCalls) ? status.toolCalls : [],
+  };
 }
 
 // 主动停止后台生成
 export async function stopGeneration(conversationId: string) {
-  const res = await request(`/conversations/${conversationId}/stop-generation`, { method: 'POST' });
-  return res.json();
+  return getElectronKernelChatApi().stop(conversationId);
 }
 
 // 获取对话上下文大小
@@ -630,7 +783,7 @@ export async function getContextSize(conversationId: string): Promise<{ tokens: 
   return res.json();
 }
 
-// 手动压缩对话 — delegates to engine's /compact command
+// 手动压缩对话 — 当前仍受 kernel session-context command blocker 限制
 export async function compactConversation(
   id: string,
   instruction?: string
@@ -653,11 +806,11 @@ export async function answerUserQuestion(
   toolUseId: string,
   answers: Record<string, string>
 ): Promise<{ ok: boolean }> {
-  const res = await request(`/conversations/${conversationId}/answer`, {
-    method: 'POST',
-    body: JSON.stringify({ request_id: requestId, tool_use_id: toolUseId, answers }),
+  return getElectronKernelChatApi().answer(conversationId, {
+    request_id: requestId,
+    tool_use_id: toolUseId,
+    answers,
   });
-  return res.json();
 }
 
 export async function decidePermissionRequest(
@@ -666,35 +819,15 @@ export async function decidePermissionRequest(
   decision: 'allow_once' | 'allow_session' | 'deny' | 'abort',
   reason?: string
 ): Promise<{ ok: boolean }> {
-  const res = await request(`/conversations/${conversationId}/permissions/${permissionRequestId}`, {
-    method: 'POST',
-    body: JSON.stringify({
-      decision,
-      reason,
-    }),
+  return getElectronKernelChatApi().decidePermission(conversationId, permissionRequestId, {
+    decision,
+    reason,
   });
-  return res.json();
 }
 
 // Pre-warm engine for a conversation (spawn in background before user sends first message)
 export function warmEngine(conversationId: string): void {
-  const userMode = getUserModeForConversation(conversationId);
-  let userProfile: any;
-  try {
-    const p = JSON.parse(localStorage.getItem('user_profile') || localStorage.getItem('user') || '{}');
-    const wf = p.work_function; const pp = p.personal_preferences;
-    userProfile = (wf || pp) ? { work_function: wf, personal_preferences: pp } : undefined;
-  } catch { userProfile = undefined; }
-  // Fire-and-forget — don't block UI
-  request(`/conversations/${conversationId}/warm`, {
-    method: 'POST',
-    body: JSON.stringify({
-      env_token: localStorage.getItem('CUSTOM_API_KEY') || localStorage.getItem('ANTHROPIC_API_KEY') || undefined,
-      env_base_url: localStorage.getItem('CUSTOM_BASE_URL') || localStorage.getItem('ANTHROPIC_BASE_URL') || undefined,
-      user_mode: userMode,
-      user_profile: userProfile,
-    }),
-  }).catch(() => {}); // ignore errors
+  void conversationId;
 }
 
 // ===== Provider Management =====
@@ -743,9 +876,8 @@ export async function getProviderModels(): Promise<Array<{ id: string; name: str
 }
 
 // Check if a conversation has an active engine stream
-export async function getStreamStatus(conversationId: string): Promise<{ active: boolean; eventCount: number }> {
-  const res = await request(`/conversations/${conversationId}/stream-status`);
-  return res.json();
+export async function getStreamStatus(conversationId: string): Promise<{ active: boolean; foregroundActive?: boolean; eventCount: number }> {
+  return getElectronKernelChatApi().status(conversationId);
 }
 
 // Reconnect to an active stream — receives buffered + live SSE events
@@ -756,16 +888,17 @@ export function reconnectStream(
   onError: (err: string) => void,
   onThinking?: (thinking: string, full: string) => void,
   onSystem?: (event: string, message: string, data: any) => void,
-  onToolUse?: (event: { type: 'start' | 'done'; tool_use_id: string; tool_name?: string; tool_input?: any; content?: string; is_error?: boolean }) => void,
+  onToolUse?: (event: { type: 'start' | 'input' | 'done'; tool_use_id: string; parent_tool_use_id?: string; tool_name?: string; tool_input?: any; textBefore?: string; content?: string; is_error?: boolean }) => void,
   signal?: AbortSignal
 ): void {
   let fullText = '';
   let thinkingText = '';
 
-  fetch(`${API_BASE}/conversations/${conversationId}/reconnect`, { signal })
-    .then(async (res) => {
-      if (!res.ok || !res.body) { onError('Reconnect failed'); return; }
-      const reader = res.body.getReader();
+  void (async () => {
+    let stream: KernelChatStream | null = null;
+    try {
+      stream = await openKernelChatStream(conversationId, signal);
+      const reader = stream.reader;
       const decoder = new TextDecoder();
       let buffer = '';
 
@@ -794,14 +927,21 @@ export function reconnectStream(
                 onThinking(parsed.delta.thinking, thinkingText);
               }
             }
+            if (parsed.type === 'final_text') {
+              const finalText = typeof parsed.text === 'string' ? parsed.text : '';
+              if (finalText && fullText.trim() !== finalText.trim()) {
+                fullText = finalText;
+                onDelta('', fullText);
+              }
+            }
             if (parsed.type === 'tool_use_start' && onToolUse) {
-              onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, textBefore: parsed.textBefore || '' });
+              onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, parent_tool_use_id: parsed.parent_tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, textBefore: parsed.textBefore || '' });
             }
             if (parsed.type === 'tool_use_input' && onToolUse) {
-              onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, tool_input: parsed.tool_input });
+              onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, parent_tool_use_id: parsed.parent_tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input });
             }
             if (parsed.type === 'tool_use_done' && onToolUse) {
-              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content, is_error: parsed.is_error });
+              onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, parent_tool_use_id: parsed.parent_tool_use_id, tool_name: parsed.tool_name, content: parsed.content, is_error: parsed.is_error });
             }
             if (parsed.type === 'ask_user' && onSystem) {
               onSystem('ask_user', '', parsed);
@@ -814,6 +954,14 @@ export function reconnectStream(
             }
             if (parsed.type === 'control_request_resolved' && onSystem) {
               onSystem('control_request_resolved', '', parsed);
+            }
+            if (parsed.type === 'foreground_done' && onSystem) {
+              const finalText = typeof parsed.text === 'string' ? parsed.text : '';
+              if (finalText && fullText.trim() !== finalText.trim()) {
+                fullText = finalText;
+                onDelta('', fullText);
+              }
+              onSystem('foreground_done', '', { ...parsed, visible_text: fullText || finalText });
             }
             if (parsed.type === 'task_event' && onSystem) {
               onSystem('task_event', '', parsed);
@@ -830,6 +978,11 @@ export function reconnectStream(
               }
             }
             if (parsed.type === 'message_stop') {
+              const finalText = typeof parsed.text === 'string' ? parsed.text : '';
+              if (finalText && fullText.trim() !== finalText.trim()) {
+                fullText = finalText;
+                onDelta('', fullText);
+              }
               if (fullText) { onDone(fullText); return; }
             }
             if (parsed.type === 'error') {
@@ -839,10 +992,12 @@ export function reconnectStream(
           } catch (_) {}
         }
       }
-    })
-    .catch((err) => {
-      if (err.name !== 'AbortError') onError(err.message || 'Reconnect failed');
-    });
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') onError(err?.message || 'Reconnect failed');
+    } finally {
+      stream?.close();
+    }
+  })();
 }
 
 // 删除指定消息及其后续消息
@@ -1078,46 +1233,18 @@ export async function sendMessage(
   onDocument?: (document: { id: string; title: string; filename: string; url: string; content?: string; format?: 'markdown' | 'docx' | 'pptx'; slides?: Array<{ title: string; content: string; notes?: string }> }) => void,
   onDocumentDraft?: (draft: { draft_id: string; title?: string; format?: string; preview?: string; preview_available?: boolean; done?: boolean; document?: any }) => void,
   onCodeExecution?: (data: { type: string; executionId: string; code?: string; language?: string; files?: Array<{ id: string; name: string }>; stdout?: string; stderr?: string; images?: string[]; error?: string | null }) => void,
-  onToolUse?: (event: { type: 'start' | 'done'; tool_use_id: string; tool_name?: string; tool_input?: any; content?: string; is_error?: boolean }) => void,
+  onToolUse?: (event: { type: 'start' | 'input' | 'done'; tool_use_id: string; parent_tool_use_id?: string; tool_name?: string; tool_input?: any; textBefore?: string; content?: string; is_error?: boolean }) => void,
   signal?: AbortSignal
 ) {
-  const token = getToken();
   let fullText = '';
+  let stream: KernelChatStream | null = null;
   try {
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        conversation_id: conversationId,
-        message,
-        attachments: attachments || undefined,
-        env_token: localStorage.getItem('CUSTOM_API_KEY') || localStorage.getItem('ANTHROPIC_API_KEY') || undefined,
-        env_base_url: localStorage.getItem('CUSTOM_BASE_URL') || localStorage.getItem('ANTHROPIC_BASE_URL') || undefined,
-        user_mode: getUserModeForConversation(conversationId),
-        user_profile: (() => {
-          try {
-            const p = JSON.parse(localStorage.getItem('user_profile') || localStorage.getItem('user') || '{}');
-            const wf = p.work_function;
-            const pp = p.personal_preferences;
-            return (wf || pp) ? { work_function: wf, personal_preferences: pp } : undefined;
-          } catch { return undefined; }
-        })(),
-      }),
+    stream = await openKernelChatStream(
+      conversationId,
       signal,
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: '请求失败' }));
-      onError(err.error || '请求失败');
-      return;
-    }
-
-    if (!res.body) return;
-
-    const reader = res.body.getReader();
+      buildKernelChatPayload(conversationId, message, attachments)
+    );
+    const reader = stream.reader;
     const decoder = new TextDecoder();
     let buffer = '';
     let thinkingText = '';
@@ -1435,6 +1562,31 @@ export async function sendMessage(
             continue;
           }
 
+          if (parsed.type === 'foreground_done') {
+            processInlineArtifactText('', true);
+            flushPending();
+            const finalText = typeof parsed.text === 'string' ? parsed.text : '';
+            if (finalText && fullText.trim() !== finalText.trim()) {
+              fullText = finalText;
+              onDelta('', fullText);
+            }
+            if (onSystem) {
+              onSystem('foreground_done', '', { ...parsed, visible_text: fullText || finalText });
+            }
+            continue;
+          }
+
+          if (parsed.type === 'final_text') {
+            processInlineArtifactText('', true);
+            flushPending();
+            const finalText = typeof parsed.text === 'string' ? parsed.text : '';
+            if (finalText && fullText.trim() !== finalText.trim()) {
+              fullText = finalText;
+              onDelta('', fullText);
+            }
+            continue;
+          }
+
           // Handle task/agent progress events
           if (parsed.type === 'task_event') {
             if (onSystem) {
@@ -1445,13 +1597,13 @@ export async function sendMessage(
 
           // Handle tool use events
           if (parsed.type === 'tool_use_start' && onToolUse) {
-            onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, textBefore: parsed.textBefore || '' });
+            onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, parent_tool_use_id: parsed.parent_tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, textBefore: parsed.textBefore || '' });
           }
           if (parsed.type === 'tool_use_input' && onToolUse) {
-            onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, tool_input: parsed.tool_input });
+            onToolUse({ type: 'input', tool_use_id: parsed.tool_use_id, parent_tool_use_id: parsed.parent_tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input });
           }
           if (parsed.type === 'tool_use_done' && onToolUse) {
-            onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content, is_error: parsed.is_error });
+            onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, parent_tool_use_id: parsed.parent_tool_use_id, tool_name: parsed.tool_name, content: parsed.content, is_error: parsed.is_error });
           }
 
           // Research mode events — forward as system events for MainContent to handle
@@ -1473,6 +1625,12 @@ export async function sendMessage(
 
           if (parsed.type === 'message_stop') {
             processInlineArtifactText('', true);
+            const finalText = typeof parsed.text === 'string' ? parsed.text : '';
+            if (finalText && fullText.trim() !== finalText.trim()) {
+              flushPending();
+              fullText = finalText;
+              onDelta('', fullText);
+            }
             // 如果有文本内容才结束，否则可能是服务端工具中间的 message_stop
             if (fullText) {
               flushPending();
@@ -1507,12 +1665,14 @@ export async function sendMessage(
     }
   } catch (err: any) {
     // 用户主动中断不算错误
-    if (err.name === 'AbortError') {
+    if (err?.name === 'AbortError') {
       // 主动中断时也先把已积累的内容刷到界面
       onDone(fullText);
       return;
     }
-    onError(err.message || 'Network error');
+    onError(err?.message || 'Network error');
+  } finally {
+    stream?.close();
   }
 }
 

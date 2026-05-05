@@ -11,7 +11,10 @@ const vendorDir = path.resolve(desktopRoot, 'electron', 'vendor');
 const targetKernelRoot = path.resolve(vendorDir, 'hare-code-kernel');
 const targetKernelDist = path.resolve(targetKernelRoot, 'dist');
 const desktopPackagePath = path.resolve(desktopRoot, 'package.json');
-const defaultReleaseRepo = process.env.HARE_CODE_RELEASE_REPO || 'go-hare/hare-code';
+const defaultReleaseRepo =
+  process.env.CLAUDE_CODE_RELEASE_REPO ||
+  process.env.HARE_CODE_RELEASE_REPO ||
+  'go-hare/hare-code';
 
 const bunBinary = process.platform === 'win32' ? 'bun.exe' : 'bun';
 const npmBinary = process.platform === 'win32' ? 'npm.cmd' : 'npm';
@@ -22,6 +25,15 @@ const builtinSpecifierSet = new Set(
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+function getKernelPackageName() {
+  try {
+    const packageJson = readJson(path.resolve(hareCodeRoot, 'package.json'));
+    return String(packageJson.name || '').trim() || 'claude-code';
+  } catch {
+    return 'claude-code';
+  }
 }
 
 function resolveHareCodeRoot() {
@@ -183,7 +195,7 @@ function installKernelRuntimeDependencies(sourceDist, sourcePackageRoot) {
 function syncKernelDist(sourceDist, label, sourcePackageRoot) {
   const kernelEntry = path.resolve(sourceDist, 'kernel.js');
   if (!fs.existsSync(kernelEntry)) {
-    console.error(`Missing hare-code kernel bundle: ${kernelEntry}`);
+    console.error(`Missing claude-code kernel bundle: ${kernelEntry}`);
     process.exit(1);
   }
 
@@ -196,7 +208,7 @@ function syncKernelDist(sourceDist, label, sourcePackageRoot) {
     'utf8',
   );
   installKernelRuntimeDependencies(sourceDist, sourcePackageRoot);
-  console.log(`Synced hare-code kernel dist from ${label} -> ${targetKernelDist}`);
+  console.log(`Synced claude-code kernel dist from ${label} -> ${targetKernelDist}`);
 }
 
 async function downloadFile(url, outputPath) {
@@ -223,7 +235,10 @@ async function downloadFile(url, outputPath) {
 }
 
 function resolveLocalTgz(desktopVersion) {
-  const localTarball = path.resolve(hareCodeRoot, `hare-code-${desktopVersion}.tgz`);
+  const localTarball = path.resolve(
+    hareCodeRoot,
+    `${getKernelPackageName()}-${desktopVersion}.tgz`,
+  );
   return fs.existsSync(localTarball) ? localTarball : '';
 }
 
@@ -233,7 +248,7 @@ function refreshSiblingTarball(desktopVersion) {
     return resolveLocalTgz(desktopVersion);
   }
 
-  console.log(`Refreshing local hare-code tarball for version ${desktopVersion}...`);
+  console.log(`Refreshing local claude-code tarball for version ${desktopVersion}...`);
   run(bunBinary, ['run', 'build'], { cwd: hareCodeRoot });
   const packResult = run(
     npmBinary,
@@ -251,7 +266,7 @@ function refreshSiblingTarball(desktopVersion) {
     .pop();
 
   if (!tarballName) {
-    console.error(`Unable to refresh local hare-code tarball for version ${desktopVersion}`);
+    console.error(`Unable to refresh local claude-code tarball for version ${desktopVersion}`);
     process.exit(1);
   }
 
@@ -284,7 +299,7 @@ async function resolveTarballSource(packageSpec) {
   }
 
   const versionTag = desktopVersion.startsWith('v') ? desktopVersion : `v${desktopVersion}`;
-  const assetName = `hare-code-${desktopVersion}.tgz`;
+  const assetName = `${getKernelPackageName()}-${desktopVersion}.tgz`;
   const downloadUrl = `https://github.com/${defaultReleaseRepo}/releases/download/${versionTag}/${assetName}`;
   const downloadTarget = path.resolve(
     desktopRoot,
@@ -335,7 +350,7 @@ async function syncFromPackage(packageSpec) {
       .pop();
 
     if (!tarballName) {
-      console.error(`Unable to resolve packed hare-code artifact for ${tarballSource.value}`);
+      console.error(`Unable to resolve packed claude-code artifact for ${tarballSource.value}`);
       process.exit(1);
     }
   } else {
@@ -351,7 +366,7 @@ async function syncFromPackage(packageSpec) {
     'dist',
   );
   if (!fs.existsSync(path.resolve(packedDist, 'kernel.js'))) {
-    console.error(`Missing packed hare-code kernel bundle: ${path.resolve(packedDist, 'kernel.js')}`);
+    console.error(`Missing packed claude-code kernel bundle: ${path.resolve(packedDist, 'kernel.js')}`);
     process.exit(1);
   }
 
@@ -363,9 +378,9 @@ async function syncFromPackage(packageSpec) {
     path.resolve(tempDir, 'package'),
   );
   if (tarballSource.mode === 'npm-pack') {
-    console.log(`Resolved hare-code package spec "${tarballSource.value}"`);
+    console.log(`Resolved claude-code package spec "${tarballSource.value}"`);
   } else {
-    console.log(`Resolved hare-code package from ${tarballSource.mode} "${tarballSource.value}"`);
+    console.log(`Resolved claude-code package from ${tarballSource.mode} "${tarballSource.value}"`);
   }
 }
 
@@ -382,7 +397,7 @@ async function main() {
 
   if (sourceMode === 'sibling') {
     if (!canUseSibling) {
-      console.error(`Sibling hare-code package not found: ${siblingPackagePath}`);
+      console.error(`Sibling claude-code package not found: ${siblingPackagePath}`);
       process.exit(1);
     }
     syncFromSibling();

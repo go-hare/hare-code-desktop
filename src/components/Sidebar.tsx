@@ -599,7 +599,7 @@ const getWorkspaceName = (workspacePath: string) => {
               <button
                 key={item.label}
                 onClick={() => handleNavClick(item.label)}
-                className={`w-full flex items-center justify-start text-claude-text hover:bg-claude-hover rounded-lg transition-colors group overflow-hidden whitespace-nowrap ${(location.pathname === '/chats' && item.label === 'Chats') || (location.pathname === '/projects' && item.label === 'Projects') ? 'bg-claude-hover' : ''}`}
+                className={`w-full flex items-center justify-start text-claude-text hover:bg-claude-hover rounded-lg transition-colors group overflow-hidden whitespace-nowrap ${(location.pathname === '/chats' && item.label === 'Chats') || (location.pathname === '/projects' && item.label === 'Projects') || (location.pathname === '/artifacts' && item.label === 'Artifacts') ? 'bg-claude-hover' : ''}`}
                 style={{
                   fontWeight: 400,
                   paddingTop: '2px',

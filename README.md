@@ -9,8 +9,8 @@
 当前以 sibling 内核包 `../claude-code` 的版本号为真源。桌面端版本建议始终与内核包保持一致：
 
 ```bash
-node ../claude-code/scripts/sync-sibling-version.mjs --only hare-code-desktop
-node ../claude-code/scripts/check-sibling-version.mjs --only hare-code-desktop
+node ./scripts/sibling-version.cjs sync
+node ./scripts/sibling-version.cjs check
 ```
 
 ## 本地开发
@@ -37,9 +37,15 @@ bun run build
 bun run kernel:build:package
 ```
 
-默认会按当前桌面端版本优先查找 sibling 目录里的 `hare-code-<version>.tgz`；如果当前工作区存在 sibling `../claude-code`，脚本会先重新 build 并刷新这个本地 tgz，再从打包产物里抽出整套 `dist` 到 `electron/vendor/hare-code-kernel/dist`。如果本地没有该 tarball，则会自动从 GitHub Release 下载 `hare-code-<version>.tgz`。
+默认会按当前桌面端版本优先查找 sibling 目录里的 `claude-code-<version>.tgz`；如果当前工作区存在 sibling `../claude-code`，脚本会先重新 build 并刷新这个本地 tgz，再从打包产物里抽出整套 `dist` 到 `electron/vendor/hare-code-kernel/dist`。如果本地没有该 tarball，则会自动从 GitHub Release 下载 `claude-code-<version>.tgz`。
 
 如需指定发布仓库，可设置：
+
+```bash
+CLAUDE_CODE_RELEASE_REPO=go-hare/hare-code
+```
+
+兼容旧环境变量：
 
 ```bash
 HARE_CODE_RELEASE_REPO=go-hare/hare-code
@@ -58,3 +64,22 @@ bun run electron:build:release:win
 bun run electron:build:release:mac
 bun run electron:build:release:linux
 ```
+
+## 当前限制
+
+- 手动 `compact` 目前仍未接通。桌面端现在会明确返回
+  `kernel_compact_session_context_unavailable`，原因是 public kernel command
+  execution 还拿不到当前 conversation 的 session message context。
+
+## 最近验证
+
+- `node ./scripts/sibling-version.cjs check` 通过，当前 desktop 与 sibling
+  `claude-code` 版本同为 `1.7.3`。
+- `bun test electron/kernelChatSemanticEvents.test.js electron/kernelChatRuntimeHelpers.test.js src/utils/runtimeTaskEventLinking.test.ts src/utils/desktopBackgroundTurnParity.test.ts`
+  通过，`19 pass`。
+- vendor `kernel.js` / `kernel-runtime.js` 已重新同步到当前 sibling `dist`，
+  且 sha256 一致。
+- `bun run build` 通过。
+- `CSC_IDENTITY_AUTO_DISCOVERY=false ELECTRON_CACHE="$PWD/.cache/electron" ./node_modules/.bin/electron-builder --dir`
+  通过，生成 `release/mac-arm64/hare Desktop.app`；这是一轮 unsigned / ad-hoc
+  release smoke，不包含 notarization。

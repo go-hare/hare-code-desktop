@@ -18,6 +18,32 @@ import DocumentCreationProcess, { DocumentDraftInfo } from './DocumentCreationPr
 import CodeExecution from './CodeExecution';
 import ToolDiffView, { shouldUseDiffView, hasExpandableContent, getToolStats } from './ToolDiffView';
 import { executeCode, sendCodeResult, setStatusCallback } from '../pyodideRunner';
+import {
+  INTERNAL_TOOL_NAMES as RUNTIME_INTERNAL_TOOL_NAMES,
+  applyToolEventToMessages as applyRuntimeToolEventToMessages,
+  applyTaskEventToMessages as applyRuntimeTaskEventToMessages,
+} from '../utils/runtimeTaskEventLinking';
+import {
+  abortStreamSession as abortTrackedStreamSession,
+  beginStreamSession as beginTrackedStreamSession,
+  clearStreamSession as clearTrackedStreamSession,
+  consumeForegroundRelease as consumeTrackedForegroundRelease,
+  createStreamSessionState,
+  isReleasedForegroundStream as isTrackedForegroundReleased,
+  isStreamSessionActive as isTrackedStreamSessionActive,
+  releaseForegroundStream as releaseTrackedForegroundStream,
+  shouldHandleBackgroundStreamEvent as shouldHandleTrackedBackgroundStreamEvent,
+} from '../utils/streamSessionState';
+import {
+  formatInlineTaskEventText,
+  getInlineTaskDetail,
+  getInlineTaskLabel,
+  selectVisibleAssistantText,
+} from '../utils/inlineTaskPresentation';
+import {
+  getInlineTaskDebugExpandFlag,
+  messageHasInlineTaskDetails,
+} from '../utils/inlineTaskDebug';
 
 function formatChatError(err: string): string {
   const lower = (err || '').toLowerCase();
@@ -333,6 +359,23 @@ function parseInlineArtifactDisplay(content: any): { cleanedContent: string; dra
   };
 }
 
+function messageDisplayContent(message: any): string {
+  const projected = extractTextContent(message?.projectedContent);
+  if (projected) return projected;
+  return extractTextContent(message?.content);
+}
+
+function messageDisplayToolCalls(message: any): any[] {
+  if (Array.isArray(message?.projectedToolCalls)) return message.projectedToolCalls;
+  return Array.isArray(message?.toolCalls) ? message.toolCalls : [];
+}
+
+function isMainProjectedMessage(message: any): boolean {
+  return message?.role === 'assistant'
+    && message?.viewProjection?.source === 'electron-main'
+    && Number(message?.viewProjection?.version || 0) >= 1;
+}
+
 // Apply a research_* SSE event to the last assistant message in a messages array.
 // Returns a new messages array (mutates a clone of the last message).
 function applyResearchEvent(prev: any[], event: string, data: any): any[] {
@@ -406,6 +449,419 @@ function applyResearchEvent(prev: any[], event: string, data: any): any[] {
   return newMsgs;
 }
 
+const INTERNAL_TOOL_NAMES = RUNTIME_INTERNAL_TOOL_NAMES;
+
+function hasObjectEntries(value: any) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0);
+}
+
+function isUnknownEmptyToolCall(toolCall: any) {
+  const name = String(toolCall?.name || '').trim();
+  return (!name || name === 'unknown')
+    && !hasObjectEntries(toolCall?.input)
+    && !hasRuntimeMessageValue(toolCall?.result)
+    && !hasRuntimeMessageValue(toolCall?.textBefore)
+    && !hasRuntimeMessageValue(toolCall?.childToolCalls);
+}
+
+function isAnonymousToolCall(toolCall: any) {
+  const name = String(toolCall?.name || '').trim();
+  return !name || name === 'unknown';
+}
+
+function isAnonymousResultToolCall(toolCall: any) {
+  return isAnonymousToolCall(toolCall)
+    && !hasObjectEntries(toolCall?.input)
+    && hasRuntimeMessageValue(toolCall?.result)
+    && !hasRuntimeMessageValue(toolCall?.childToolCalls)
+    && !hasRuntimeMessageValue(toolCall?.subagent);
+}
+
+function shouldHideAnonymousTaskOutput(toolCall: any) {
+  return isAnonymousResultToolCall(toolCall);
+}
+
+function isAnonymousCompatTaskContainer(toolCall: any) {
+  if (!isAnonymousToolCall(toolCall)) return false;
+  if (!Array.isArray(toolCall?.childToolCalls) || toolCall.childToolCalls.length === 0) return false;
+  const text = typeof toolCall?.result === 'string'
+    ? toolCall.result
+    : Array.isArray(toolCall?.result)
+      ? toolCall.result.map((item: any) => (typeof item?.text === 'string' ? item.text : '')).join('\n')
+      : '';
+  return /Async agent launched successfully|agentId:\s*[a-z0-9_-]+|output_file:/i.test(text);
+}
+
+function isOrphanUnknownToolEvent(toolEvent: any) {
+  return !String(toolEvent?.parent_tool_use_id || '').trim()
+    && !String(toolEvent?.tool_name || '').trim()
+    && !hasObjectEntries(toolEvent?.tool_input)
+    && !hasRuntimeMessageValue(toolEvent?.content)
+    && !hasRuntimeMessageValue(toolEvent?.textBefore);
+}
+
+function toolDisplayName(name: string) {
+  const nameMap: Record<string, string> = {
+    Read: 'Read file',
+    Write: 'Write file',
+    Edit: 'Edit file',
+    Bash: 'Run command',
+    ListDir: 'List directory',
+    MultiEdit: 'Edit files',
+    Search: 'Search',
+    Grep: 'Search',
+    Glob: 'Find',
+    Skill: 'Skill',
+    Agent: 'Agent',
+  };
+  return nameMap[name] || (isAnonymousToolCall({ name }) ? 'Tool output' : name);
+}
+
+function formatToolInputPreview(toolCall: any) {
+  const input = toolCall?.input || {};
+  const hasInput = typeof input === 'string' ? input.trim().length > 0 : hasObjectEntries(input);
+  const inputStr = hasInput ? (typeof input === 'string' ? input : JSON.stringify(input, null, 2)) : '';
+  const rawPath = typeof input === 'object' && input ? (input.file_path || input.path || '') : '';
+  const shortPath = rawPath ? rawPath.split(/[/\\]/).pop() || rawPath : '';
+  const actionLabel: Record<string, string> = {
+    Read: 'Read',
+    Write: 'Write',
+    Edit: 'Edit',
+    MultiEdit: 'Edit',
+    Bash: '',
+    Grep: 'Search',
+    Glob: 'Find',
+    ListDir: 'List',
+    Skill: 'Skill',
+    Agent: 'Agent',
+  };
+  const prefix = actionLabel[toolCall?.name] ?? toolCall?.name;
+  const fileOrCmd = shortPath
+    || (typeof input === 'object' && input ? (input.command || input.pattern || input.description) : '')
+    || (inputStr ? (inputStr.length > 80 ? `${inputStr.slice(0, 80)}...` : inputStr) : '');
+  if (prefix && fileOrCmd) return `${prefix} ${fileOrCmd}`;
+  if (fileOrCmd) return fileOrCmd;
+  if (isAnonymousToolCall(toolCall)) return '';
+  return prefix || toolCall?.name || '';
+}
+
+function formatToolResultPreview(result: any, maxLength = 1400) {
+  if (result == null || result === '') return '';
+  const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function cloneToolCallTree(toolCall: any): any {
+  if (!toolCall || typeof toolCall !== 'object') return toolCall;
+  return {
+    ...toolCall,
+    childToolCalls: Array.isArray(toolCall.childToolCalls)
+      ? toolCall.childToolCalls.map((child: any) => cloneToolCallTree(child))
+      : toolCall.childToolCalls,
+  };
+}
+
+function extractTaskOutputPathFromToolResult(result: any) {
+  const text = typeof result === 'string'
+    ? result
+    : Array.isArray(result)
+      ? result.map((item: any) => (typeof item?.text === 'string' ? item.text : '')).join('\n')
+      : '';
+  const xmlMatch = text.match(/<output_file>([^<]+)<\/output_file>/i);
+  const lineMatch = text.match(/(?:^|\n)\s*output_file:\s*([^\n]+)/i);
+  return String(xmlMatch?.[1] || lineMatch?.[1] || '').trim();
+}
+
+function extractTaskIdFromToolCall(toolCall: any) {
+  const taskId = String(toolCall?.subagent?.task_id || '').trim();
+  if (taskId) return taskId;
+  const text = typeof toolCall?.result === 'string'
+    ? toolCall.result
+    : Array.isArray(toolCall?.result)
+      ? toolCall.result.map((item: any) => (typeof item?.text === 'string' ? item.text : '')).join('\n')
+      : '';
+  const idMatch = text.match(/agentId:\s*([a-z0-9_-]+)/i);
+  return String(idMatch?.[1] || '').trim();
+}
+
+function isSyntheticTaskOutputAgent(toolCall: any) {
+  return toolCall?.name === 'Agent' && String(toolCall?.id || '').startsWith('desktop-task:');
+}
+
+function liveAgentMatchesSyntheticTask(liveAgent: any, syntheticAgent: any) {
+  if (!liveAgent || !syntheticAgent || liveAgent === syntheticAgent) return false;
+  if (liveAgent?.name !== 'Agent' || isSyntheticTaskOutputAgent(liveAgent)) return false;
+  const syntheticTaskId = extractTaskIdFromToolCall(syntheticAgent);
+  const liveTaskId = extractTaskIdFromToolCall(liveAgent);
+  if (syntheticTaskId && liveTaskId && syntheticTaskId === liveTaskId) return true;
+
+  const liveChildIds = new Set(
+    (liveAgent?.childToolCalls || [])
+      .map((child: any) => String(child?.id || '').trim())
+      .filter(Boolean),
+  );
+  for (const child of syntheticAgent?.childToolCalls || []) {
+    const rawId = rawFallbackChildId(child?.id);
+    if (rawId && liveChildIds.has(rawId)) return true;
+  }
+
+  const syntheticOutputFile = String(syntheticAgent?.subagent?.output_file || '').trim();
+  const liveOutputFile = extractTaskOutputPathFromToolResult(liveAgent?.result);
+  return !!(syntheticOutputFile && liveOutputFile && syntheticOutputFile === liveOutputFile);
+}
+
+function rawFallbackChildId(toolCallId: string) {
+  const text = String(toolCallId || '').trim();
+  const match = text.match(/(call_[A-Za-z0-9]+)$/);
+  return String(match?.[1] || text).trim();
+}
+
+function mergeSyntheticTaskOutputIntoLiveAgent(liveAgent: any, syntheticAgent: any) {
+  if (!liveAgent || !syntheticAgent) return;
+  if (!hasRuntimeMessageValue(liveAgent.subagent) && hasRuntimeMessageValue(syntheticAgent.subagent)) {
+    liveAgent.subagent = syntheticAgent.subagent;
+  }
+  const liveChildren = Array.isArray(liveAgent.childToolCalls) ? liveAgent.childToolCalls : [];
+  liveAgent.childToolCalls = liveChildren;
+  for (const fallbackChild of syntheticAgent.childToolCalls || []) {
+    const rawId = rawFallbackChildId(fallbackChild?.id);
+    let existing = liveChildren.find((child: any) => String(child?.id || '').trim() === rawId);
+    if (!existing) {
+      existing = liveChildren.find((child: any) => String(child?.id || '').trim() === String(fallbackChild?.id || '').trim());
+    }
+    if (existing) {
+      if (isAnonymousToolCall(existing) && !isAnonymousToolCall(fallbackChild)) {
+        existing.name = fallbackChild.name;
+      }
+      if (!hasObjectEntries(existing.input) && hasObjectEntries(fallbackChild.input)) {
+        existing.input = fallbackChild.input;
+      }
+      if (!hasRuntimeMessageValue(existing.result) && hasRuntimeMessageValue(fallbackChild.result)) {
+        existing.result = fallbackChild.result;
+      }
+      if ((!existing.status || existing.status === 'running') && fallbackChild.status) {
+        existing.status = fallbackChild.status;
+      }
+      continue;
+    }
+    liveChildren.push({
+      ...cloneToolCallTree(fallbackChild),
+      id: rawId || fallbackChild.id,
+    });
+  }
+}
+
+function mergeCompatTaskContainerIntoLiveAgent(liveAgent: any, compatToolCall: any) {
+  if (!liveAgent || !compatToolCall) return;
+  const liveChildren = Array.isArray(liveAgent.childToolCalls) ? liveAgent.childToolCalls : [];
+  liveAgent.childToolCalls = liveChildren;
+  for (const compatChild of compatToolCall.childToolCalls || []) {
+    const compatId = String(compatChild?.id || '').trim();
+    if (!compatId) continue;
+    const existing = liveChildren.find((child: any) => String(child?.id || '').trim() === compatId);
+    if (existing) continue;
+    liveChildren.push(cloneToolCallTree(compatChild));
+  }
+}
+
+function coalesceOrphanToolCallsIntoAgents(toolCalls: any[]) {
+  const clonedToolCalls = (toolCalls || []).map((toolCall: any) => cloneToolCallTree(toolCall));
+  const syntheticTaskOutputIds = new Set<string>();
+  for (const toolCall of clonedToolCalls) {
+    if (!isSyntheticTaskOutputAgent(toolCall)) continue;
+    const liveAgent = clonedToolCalls.find((candidate: any) => liveAgentMatchesSyntheticTask(candidate, toolCall));
+    if (!liveAgent) continue;
+    mergeSyntheticTaskOutputIntoLiveAgent(liveAgent, toolCall);
+    syntheticTaskOutputIds.add(String(toolCall.id || ''));
+  }
+  const hiddenCompatIds = new Set<string>();
+  for (const toolCall of clonedToolCalls) {
+    if (!isAnonymousCompatTaskContainer(toolCall)) continue;
+    const compatTaskId = extractTaskIdFromToolCall(toolCall);
+    const liveAgent = clonedToolCalls.find((candidate: any) => (
+      candidate?.name === 'Agent'
+      && !isSyntheticTaskOutputAgent(candidate)
+      && extractTaskIdFromToolCall(candidate)
+      && extractTaskIdFromToolCall(candidate) === compatTaskId
+    ));
+    if (!liveAgent) continue;
+    mergeCompatTaskContainerIntoLiveAgent(liveAgent, toolCall);
+    hiddenCompatIds.add(String(toolCall.id || ''));
+  }
+
+  const result: any[] = [];
+  let lastAgent: any | null = null;
+  for (const toolCall of clonedToolCalls) {
+    if (syntheticTaskOutputIds.has(String(toolCall?.id || ''))) continue;
+    if (hiddenCompatIds.has(String(toolCall?.id || ''))) continue;
+    if (isUnknownEmptyToolCall(toolCall)) continue;
+    if (isAnonymousResultToolCall(toolCall) && lastAgent) {
+      lastAgent.childToolCalls = [
+        ...(lastAgent.childToolCalls || []),
+        { ...toolCall, __orphanSourceId: toolCall.id },
+      ];
+      continue;
+    }
+
+    const nextToolCall = {
+      ...toolCall,
+      childToolCalls: Array.isArray(toolCall.childToolCalls)
+        ? [...toolCall.childToolCalls]
+        : toolCall.childToolCalls,
+    };
+    result.push(nextToolCall);
+    if (nextToolCall.name === 'Agent') {
+      lastAgent = nextToolCall;
+    } else if (!isAnonymousResultToolCall(nextToolCall)) {
+      lastAgent = null;
+    }
+  }
+  return result;
+}
+
+function findToolCallById(toolCalls: any[], id: string): any | null {
+  if (!id) return null;
+  for (const toolCall of toolCalls || []) {
+    if (toolCall?.id === id) return toolCall;
+    const child = findToolCallById(toolCall?.childToolCalls || [], id);
+    if (child) return child;
+  }
+  return null;
+}
+
+function findAssistantMessageIndexByToolCallId(messages: any[], toolUseId: string): number {
+  if (!toolUseId) return -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'assistant') continue;
+    if (findToolCallById(message.toolCalls || [], toolUseId)) return index;
+  }
+  return -1;
+}
+
+function applyToolEventToList(toolCalls: any[], toolEvent: any, fallbackName?: string) {
+  if (toolEvent.type === 'start') {
+    let existing = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+    if (existing) {
+      existing.name = toolEvent.tool_name || existing.name;
+      if (toolEvent.tool_input && Object.keys(toolEvent.tool_input).length > 0) existing.input = toolEvent.tool_input;
+      if (toolEvent.textBefore) existing.textBefore = toolEvent.textBefore;
+    } else {
+      if (isOrphanUnknownToolEvent(toolEvent)) return;
+      toolCalls.push({
+        id: toolEvent.tool_use_id,
+        name: toolEvent.tool_name || fallbackName || 'unknown',
+        input: toolEvent.tool_input || {},
+        status: 'running' as const,
+        textBefore: toolEvent.textBefore || '',
+      });
+    }
+  } else if (toolEvent.type === 'input') {
+    const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+    if (tc) {
+      tc.name = toolEvent.tool_name || tc.name;
+      const nextInput = toolEvent.tool_input;
+      const hasNextInput = typeof nextInput === 'string'
+        ? nextInput.trim().length > 0
+        : hasObjectEntries(nextInput);
+      if (hasNextInput) tc.input = nextInput;
+    }
+  } else if (toolEvent.type === 'done') {
+    let tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+    if (!tc) {
+      if (isOrphanUnknownToolEvent(toolEvent)) return;
+      tc = {
+        id: toolEvent.tool_use_id,
+        name: toolEvent.tool_name || fallbackName || 'unknown',
+        input: {},
+        status: 'done' as const,
+        result: toolEvent.content,
+      };
+      toolCalls.push(tc);
+    } else {
+      tc.name = toolEvent.tool_name || tc.name;
+      tc.status = toolEvent.is_error ? 'error' as const : 'done' as const;
+      tc.result = toolEvent.content;
+    }
+  }
+}
+
+function applyToolEventToMessages(prev: any[], toolEvent: any): any[] {
+  return applyRuntimeToolEventToMessages(prev, toolEvent);
+}
+
+function pruneSyntheticAgentChildren(childToolCalls: any[], toolName: string) {
+  const name = String(toolName || '').trim();
+  if (!name) return;
+  const hasRealChild = (childToolCalls || []).some((item: any) => (
+    item?.name === name && !String(item?.id || '').startsWith('agent-child:')
+  ));
+  if (!hasRealChild) return;
+  for (let index = childToolCalls.length - 1; index >= 0; index -= 1) {
+    const child = childToolCalls[index];
+    if (child?.name === name && String(child?.id || '').startsWith('agent-child:')) {
+      childToolCalls.splice(index, 1);
+    }
+  }
+}
+
+function syntheticAgentChildId(taskId: string, toolName: string) {
+  return `agent-child:${String(taskId || 'task')}:${String(toolName || 'tool')}`;
+}
+
+function inputFromAgentTaskProgress(toolName: string, description: string) {
+  const text = String(description || '').trim();
+  if (!text) return {};
+  if (toolName === 'Read') {
+    const match = text.match(/^(?:reading|read)\s+(.+)$/i);
+    return { path: match?.[1]?.trim() || text };
+  }
+  if (toolName === 'Bash' || toolName === 'PowerShell') return { command: text };
+  if (toolName === 'Grep' || toolName === 'Search' || toolName === 'Glob') return { pattern: text };
+  return { description: text };
+}
+
+function syncSyntheticAgentChildFromTaskEvent(parent: any, data: any, description: string) {
+  parent.childToolCalls = parent.childToolCalls || [];
+  const lastToolName = String(data?.last_tool_name || parent.subagent?.last_tool_name || '').trim();
+  const taskId = String(data?.task_id || parent.subagent?.task_id || parent.id || '').trim();
+  if (lastToolName) {
+    const hasRealChild = parent.childToolCalls.some((item: any) => (
+      item?.name === lastToolName && !String(item?.id || '').startsWith('agent-child:')
+    ));
+    if (hasRealChild) return;
+    const childId = syntheticAgentChildId(taskId, lastToolName);
+    let child = parent.childToolCalls.find((item: any) => item.id === childId);
+    if (!child) {
+      child = {
+        id: childId,
+        name: lastToolName,
+        input: inputFromAgentTaskProgress(lastToolName, description),
+        status: data?.subtype === 'task_notification' ? 'done' as const : 'running' as const,
+      };
+      parent.childToolCalls.push(child);
+    }
+    child.name = lastToolName;
+    if (!hasObjectEntries(child.input)) child.input = inputFromAgentTaskProgress(lastToolName, description);
+    child.status = (data?.subtype === 'task_notification' || data?.status === 'completed') ? 'done' as const : 'running' as const;
+    if (data?.summary) child.result = formatToolResultPreview(data.summary, 1200);
+    return;
+  }
+
+  if (data?.subtype === 'task_notification' || data?.status === 'completed') {
+    for (const child of parent.childToolCalls) {
+      if (child.status === 'running') {
+        child.status = 'done';
+        if (!child.result && data?.summary) child.result = formatToolResultPreview(data.summary, 1200);
+      }
+    }
+  }
+}
+
+function applyTaskEventToMessages(prev: any[], data: any): any[] {
+  return applyRuntimeTaskEventToMessages(prev, data);
+}
+
 function sanitizeInlineArtifactMessage(message: any) {
   if (!message || message.role !== 'assistant') return message;
   const parsed = parseInlineArtifactDisplay(message.content);
@@ -416,6 +872,72 @@ function sanitizeInlineArtifactMessage(message: any) {
     next = mergeDocumentDraftIntoMessage(next, parsed.draft);
   }
   return next;
+}
+
+const RUNTIME_MESSAGE_DETAIL_KEYS = [
+  'toolCalls',
+  'projectedToolCalls',
+  'thinking',
+  'thinking_summary',
+  'thinkingSummary',
+  'citations',
+  'searchLogs',
+  'document',
+  'documents',
+  'documentDrafts',
+  'research',
+  'toolTextEndOffset',
+  'codeExecution',
+  'projectedContent',
+  'rawContent',
+  'rawToolCalls',
+];
+
+function hasRuntimeMessageValue(value: any) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === 'object') return Object.keys(value).length > 0;
+  return value != null && value !== '';
+}
+
+function hasRenderableAssistantContent(message: any) {
+  if (!message || message.role !== 'assistant') return false;
+  if (String(message.content || '').trim()) return true;
+  return RUNTIME_MESSAGE_DETAIL_KEYS.some((key) => hasRuntimeMessageValue(message[key]));
+}
+
+function mergeRuntimeMessageDetails(serverMessage: any, localMessage: any) {
+  if (!serverMessage || serverMessage.role !== 'assistant' || !localMessage || localMessage.role !== 'assistant') {
+    return serverMessage;
+  }
+  const next = { ...serverMessage, isThinking: false };
+  for (const key of RUNTIME_MESSAGE_DETAIL_KEYS) {
+    const serverValue = next[key];
+    const localValue = localMessage[key];
+    if (!hasRuntimeMessageValue(serverValue) && hasRuntimeMessageValue(localValue)) {
+      next[key] = localValue;
+    }
+  }
+  return next;
+}
+
+function mergeFinalConversationMessages(serverMessages: any[], localMessages: any[]) {
+  if (!Array.isArray(serverMessages) || serverMessages.length === 0) return localMessages;
+  const localById = new Map<string, any>();
+  for (const message of localMessages || []) {
+    if (message?.id) localById.set(String(message.id), message);
+  }
+  const merged = serverMessages.map((serverMessage, index) => {
+    const localByMessageId = serverMessage?.id ? localById.get(String(serverMessage.id)) : null;
+    const localByIndex = (localMessages || [])[index];
+    const localTrailing = index === serverMessages.length - 1 ? (localMessages || [])[localMessages.length - 1] : null;
+    return mergeRuntimeMessageDetails(serverMessage, localByMessageId || localByIndex || localTrailing);
+  });
+  const serverTail = merged[merged.length - 1];
+  const localTail = (localMessages || [])[localMessages.length - 1];
+  if (serverTail?.role !== 'assistant' && hasRenderableAssistantContent(localTail)) {
+    merged.push(localTail);
+  }
+  return merged;
 }
 
 function mergeDocumentsIntoMessage(message: any, incomingDoc?: DocumentInfo | null, incomingDocs?: DocumentInfo[] | null) {
@@ -446,6 +968,7 @@ function applyGenerationState(message: any, state: any) {
     thinkingSummary: state.thinkingSummary || message.thinkingSummary,
     citations: state.citations?.length ? state.citations : message.citations,
     searchLogs: state.searchLogs?.length ? state.searchLogs : message.searchLogs,
+    toolCalls: state.toolCalls?.length ? state.toolCalls : message.toolCalls,
     isThinking: !state.text && !!state.thinking,
   };
   const withDocuments = mergeDocumentsIntoMessage(base, state.document, state.documents);
@@ -636,7 +1159,7 @@ const MessageList = React.memo<MessageListProps>(({
                     </div>
                   </div>
                 )}
-                {(() => { const displayText = extractTextContent(msg.content); return displayText && displayText.trim() !== ''; })() && (
+                {(() => { const displayText = messageDisplayContent(msg); return displayText && displayText.trim() !== ''; })() && (
                   <div className="max-w-[85%] w-fit relative">
                     <div
                       className="bg-[#F0EEE7] dark:bg-claude-btnHover text-claude-text px-3.5 py-2.5 text-[16px] leading-relaxed font-sans font-[350] whitespace-pre-wrap break-words relative overflow-hidden"
@@ -652,7 +1175,7 @@ const MessageList = React.memo<MessageListProps>(({
                     >
                       {(() => {
                         try {
-                          const text = extractTextContent(msg.content);
+                          const text = messageDisplayContent(msg);
                           if (!text) return '';
                           const skillMatch = text.match(/^\/([a-zA-Z0-9_-]+)(\s|$)/);
                           if (skillMatch) {
@@ -664,7 +1187,7 @@ const MessageList = React.memo<MessageListProps>(({
                             </>;
                           }
                           return text;
-                        } catch { return extractTextContent(msg.content) || ''; }
+                        } catch { return messageDisplayContent(msg) || ''; }
                       })()}
                       {!expandedMessages.has(idx) && (() => {
                         const el = messageContentRefs.current.get(idx);
@@ -798,15 +1321,22 @@ const MessageList = React.memo<MessageListProps>(({
                 </button>
               )}
               {/* Tool calls display */}
-              {msg.toolCalls && msg.toolCalls.length > 0 && (() => {
+              {messageDisplayToolCalls(msg).length > 0 && (() => {
                 const FRONTEND_HIDDEN = new Set(['WebSearch', 'WebFetch']);
-                const visibleToolCalls = msg.toolCalls.filter((tc: any) => !FRONTEND_HIDDEN.has(tc.name));
+                const normalizedToolCalls = isMainProjectedMessage(msg)
+                  ? messageDisplayToolCalls(msg)
+                  : coalesceOrphanToolCallsIntoAgents(messageDisplayToolCalls(msg));
+                const visibleToolCalls = normalizedToolCalls.filter((tc: any) => (
+                  !FRONTEND_HIDDEN.has(tc.name)
+                  && !isUnknownEmptyToolCall(tc)
+                  && !shouldHideAnonymousTaskOutput(tc)
+                ));
                 if (visibleToolCalls.length === 0) return null;
                 const isCurrentMsg = idx === messages.length - 1;
                 const isStale = (!loading && isCurrentMsg) || (idx < messages.length - 1);
 
                 // Split text: work text (during tools) vs final text (after last tool done)
-                const fullText = extractTextContent(msg.content);
+                const fullText = messageDisplayContent(msg);
                 const offset = msg.toolTextEndOffset;
                 const hasOffset = offset && offset > 0 && offset < fullText.length;
                 const workText = hasOffset ? fullText.slice(0, offset).trim() : '';
@@ -818,8 +1348,16 @@ const MessageList = React.memo<MessageListProps>(({
                 // - Complete without offset: show full text (fallback)
                 // During streaming: compute pending text (text after last tool's textBefore)
                 let consumedLen = 0;
+                let consumedSnapshot = '';
                 for (const tc of visibleToolCalls) {
-                  if (tc.textBefore) consumedLen += tc.textBefore.length;
+                  const rawTextBefore = String(tc.textBefore || '');
+                  if (!rawTextBefore) continue;
+                  if (consumedSnapshot && rawTextBefore.startsWith(consumedSnapshot)) {
+                    consumedLen += rawTextBefore.length - consumedSnapshot.length;
+                  } else if (rawTextBefore !== consumedSnapshot) {
+                    consumedLen += rawTextBefore.length;
+                  }
+                  consumedSnapshot = rawTextBefore;
                 }
                 // Text currently being typed that hasn't been associated with a tool yet
                 const pendingWorkText_ui = isCurrentlyStreaming ? fullText.slice(consumedLen).trim() : '';
@@ -828,14 +1366,22 @@ const MessageList = React.memo<MessageListProps>(({
                   ? ''  // During streaming, all text goes in tool section
                   : (hasOffset ? finalText : null);
 
-                const toolNames = visibleToolCalls.map((tc: any) => {
-                  const nameMap: Record<string, string> = {
-                    'Read': 'Read file', 'Write': 'Write file', 'Edit': 'Edit file',
-                    'Bash': 'Run command', 'ListDir': 'List directory',
-                    'MultiEdit': 'Edit files', 'Search': 'Search',
-                  };
-                  return nameMap[tc.name] || tc.name;
+                let previousTextBefore = '';
+                const toolCallsForDisplay = visibleToolCalls.map((tc: any) => {
+                  const rawTextBefore = String(tc.textBefore || '');
+                  let interleavedText = '';
+                  if (rawTextBefore) {
+                    if (previousTextBefore && rawTextBefore.startsWith(previousTextBefore)) {
+                      interleavedText = rawTextBefore.slice(previousTextBefore.length);
+                    } else if (rawTextBefore !== previousTextBefore) {
+                      interleavedText = rawTextBefore;
+                    }
+                    previousTextBefore = rawTextBefore;
+                  }
+                  return { ...tc, interleavedText };
                 });
+
+                const toolNames = visibleToolCalls.map((tc: any) => toolDisplayName(tc.name));
                 const uniqueNames = [...new Set(toolNames)];
                 const allDone = visibleToolCalls.every((tc: any) => {
                   const rs = (tc.status === 'running' && isStale) ? 'canceled' : tc.status;
@@ -843,6 +1389,12 @@ const MessageList = React.memo<MessageListProps>(({
                 });
                 const hasError = visibleToolCalls.some((tc: any) => tc.status === 'error');
                 const summary = uniqueNames.join(', ');
+                const forceExpandInlineTaskCards = getInlineTaskDebugExpandFlag();
+                const hasInlineTaskDetails = messageHasInlineTaskDetails(toolCallsForDisplay);
+                const defaultToolCallsExpanded = isCurrentlyStreaming
+                  || !allDone
+                  || hasInlineTaskDetails
+                  || (forceExpandInlineTaskCards && hasInlineTaskDetails);
 
                 return (
                   <div className="mb-4">
@@ -869,34 +1421,42 @@ const MessageList = React.memo<MessageListProps>(({
                       <span className={`text-[14px] ${!allDone ? 'animate-shimmer-text' : 'text-claude-textSecondary'}`}>
                         {summary}
                       </span>
-                      <ChevronDown size={14} className={`transform transition-transform duration-200 ${(msg.isToolCallsExpanded ?? (isCurrentlyStreaming || !allDone)) ? 'rotate-180' : ''}`} />
+                      <ChevronDown size={14} className={`transform transition-transform duration-200 ${(msg.isToolCallsExpanded ?? defaultToolCallsExpanded) ? 'rotate-180' : ''}`} />
                     </div>
                     </div>
 
-                    {(msg.isToolCallsExpanded ?? (isCurrentlyStreaming || !allDone)) && (
+                    {(msg.isToolCallsExpanded ?? defaultToolCallsExpanded) && (
                       <div className="mt-2 ml-1 pl-4 border-l-2 border-claude-border space-y-2">
-                        {visibleToolCalls.map((tc: any, tcIdx: number) => {
-                          const inputStr = tc.input ? (typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input, null, 2)) : '';
-                          const rawPath = tc.input?.file_path || tc.input?.path || '';
-                          const shortPath = rawPath ? rawPath.split(/[/\\]/).pop() || rawPath : '';
-                          const actionLabel: Record<string, string> = {
-                            'Read': 'Read', 'Write': 'Write', 'Edit': 'Edit',
-                            'MultiEdit': 'Edit', 'Bash': '', 'Grep': 'Search',
-                            'Glob': 'Find', 'ListDir': 'List', 'Skill': 'Skill',
-                          };
-                          const prefix = actionLabel[tc.name] ?? tc.name;
-                          const fileOrCmd = shortPath || tc.input?.command || (inputStr.length > 80 ? inputStr.slice(0, 80) + '...' : inputStr);
-                          const inputPreview = (prefix && fileOrCmd) ? `${prefix} ${fileOrCmd}` : (fileOrCmd || prefix || tc.name);
+                        {toolCallsForDisplay.map((tc: any, tcIdx: number) => {
+                          const inputPreview = formatToolInputPreview(tc);
                           const realStatus = (tc.status === 'running' && isStale) ? 'canceled' : tc.status;
-                          const expandable = hasExpandableContent(tc.name, tc.input, tc.result);
+                          const childToolCalls = (tc.childToolCalls || []).filter((child: any) => (
+                            !isUnknownEmptyToolCall(child)
+                            && !shouldHideAnonymousTaskOutput(child)
+                          ));
+                          const hasTaskDetails = childToolCalls.length > 0 || hasRuntimeMessageValue(tc.subagent);
+                          const taskDetail = hasTaskDetails ? getInlineTaskDetail(tc.subagent, realStatus) : null;
+                          const taskHeader = hasTaskDetails ? getInlineTaskLabel(tc.subagent, taskDetail?.typeLabel || toolDisplayName(tc.name)) : '';
+                          const expandable = hasTaskDetails || hasExpandableContent(tc.name, tc.input, tc.result);
+                          const expanded = tc.isExpanded ?? (
+                            hasTaskDetails
+                            && (
+                              realStatus === 'running'
+                              || childToolCalls.length > 0
+                              || forceExpandInlineTaskCards
+                            )
+                          );
                           const stats = getToolStats(tc.name, tc.input);
+                          const toolLabel = inputPreview
+                            || (hasTaskDetails ? getInlineTaskLabel(tc.subagent, isAnonymousResultToolCall(tc) ? 'Tool output' : toolDisplayName(tc.name)) : '')
+                            || (isAnonymousResultToolCall(tc) ? 'Tool output' : toolDisplayName(tc.name));
 
                           return (
                             <div key={tc.id || tcIdx}>
                               {/* Interleaved text: what the model said BEFORE this tool call */}
-                              {tc.textBefore && (
+                              {tc.interleavedText && (
                                 <div className="text-[13px] text-claude-textSecondary px-1 py-1.5 leading-relaxed">
-                                  {tc.textBefore}
+                                  {tc.interleavedText}
                                 </div>
                               )}
                               {/* Tool card */}
@@ -908,8 +1468,10 @@ const MessageList = React.memo<MessageListProps>(({
                                     onSetMessages(prev =>
                                       prev.map((m, i) => {
                                         if (i !== idx) return m;
-                                        const newTc = [...m.toolCalls];
-                                        newTc[tcIdx] = { ...newTc[tcIdx], isExpanded: newTc[tcIdx].isExpanded === undefined ? true : !newTc[tcIdx].isExpanded };
+                                        const newTc = (m.toolCalls || []).map((item: any, itemIdx: number) => {
+                                          const sameTool = tc.id ? item.id === tc.id : itemIdx === tcIdx;
+                                          return sameTool ? { ...item, isExpanded: !expanded } : item;
+                                        });
                                         return { ...m, toolCalls: newTc };
                                       })
                                     );
@@ -922,7 +1484,7 @@ const MessageList = React.memo<MessageListProps>(({
                                       <FileText size={14} className="text-claude-textSecondary flex-shrink-0" />
                                     )}
                                     <span className="text-claude-text font-mono text-[12px] truncate">
-                                      {inputPreview || tc.name}
+                                      {toolLabel}
                                     </span>
                                   </div>
                                   <div className="flex items-center gap-2 flex-shrink-0 ml-4">
@@ -935,19 +1497,141 @@ const MessageList = React.memo<MessageListProps>(({
                                     {realStatus === 'running' && <span className="text-claude-textSecondary text-[12px] animate-shimmer-text">Running...</span>}
                                     {realStatus === 'error' && <span className="text-red-400/80 text-[12px]">Failed</span>}
                                     {expandable && (
-                                      <ChevronDown size={14} className={`text-claude-textSecondary transform transition-transform duration-200 ${(tc.isExpanded ?? false) ? 'rotate-180' : ''}`} />
+                                      <ChevronDown size={14} className={`text-claude-textSecondary transform transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`} />
                                     )}
-                                  </div>
-                                </div>
-                                {expandable && (tc.isExpanded ?? false) && (
-                                  <div className="px-2 py-2 border-t border-black/5 dark:border-white/5">
+	                                  </div>
+	                                </div>
+	                                {expandable && expanded && (
+	                                  <div className="px-2 py-2 border-t border-black/5 dark:border-white/5">
                                     {shouldUseDiffView(tc.name, tc.input) ? (
                                       <ToolDiffView toolName={tc.name} input={tc.input} result={tc.result} />
                                     ) : tc.result != null ? (
                                       <div className="px-1 text-claude-textSecondary text-[12px] font-mono max-h-[400px] overflow-y-auto whitespace-pre-wrap bg-black/5 dark:bg-black/40 rounded-md p-2">
-                                        {typeof tc.result === 'string' ? (tc.result.length > 2000 ? tc.result.slice(0, 2000) + '...' : tc.result || '(Empty output)') : JSON.stringify(tc.result).slice(0, 2000)}
+                                        {formatToolResultPreview(tc.result, 2000) || '(Empty output)'}
                                       </div>
                                     ) : null}
+                                    {hasTaskDetails && (
+                                      <div className="mt-2 space-y-2">
+                                        {taskDetail && (
+                                          <div className="rounded-md bg-black/5 dark:bg-black/30 px-2 py-1.5 text-[12px] text-claude-textSecondary">
+                                            <div className="flex items-center justify-between gap-2">
+                                              <span className="font-mono truncate">{taskHeader || taskDetail.title}</span>
+                                              <span className="font-mono text-[11px] flex-shrink-0">{taskDetail.statusLabel}</span>
+                                            </div>
+                                            {taskDetail.currentToolName && (
+                                              <div className="mt-1 font-mono text-[11px] opacity-75">
+                                                Current: {toolDisplayName(taskDetail.currentToolName)}
+                                              </div>
+                                            )}
+                                            {taskDetail.summary && taskDetail.summary !== taskDetail.title && (
+                                              <div className="mt-1 font-mono text-[11px] opacity-75 truncate">
+                                                Summary: {taskDetail.summary}
+                                              </div>
+                                            )}
+                                            {taskDetail.outputFileName && (
+                                              <div className="mt-1 font-mono text-[11px] opacity-75 truncate">
+                                                Output: {taskDetail.outputFileName}
+                                              </div>
+                                            )}
+                                            {taskDetail.progressLines.length > 0 && (
+                                              <div className="mt-2 space-y-1">
+                                                {taskDetail.progressLines.map((line: string, lineIdx: number) => (
+                                                  <div key={`${line}-${lineIdx}`} className="flex items-center gap-2 font-mono text-[11px] opacity-80">
+                                                    <span className="h-1.5 w-1.5 rounded-full bg-claude-textSecondary/50 flex-shrink-0" />
+                                                    <span className="truncate">{line}</span>
+                                                  </div>
+                                                ))}
+                                              </div>
+                                            )}
+                                            {Array.isArray(tc.subagent?.events) && tc.subagent.events.length > 0 && (
+                                              <div className="mt-2 space-y-1">
+                                                {tc.subagent.events.slice(-8).map((event: any, eventIdx: number) => (
+                                                  <div key={`${event.subtype || 'event'}-${eventIdx}`} className="flex items-center gap-2 font-mono text-[11px] opacity-80">
+                                                    <span className="h-1.5 w-1.5 rounded-full bg-claude-textSecondary/50 flex-shrink-0" />
+                                                    <span className="truncate">
+                                                      {event.last_tool_name ? `${toolDisplayName(event.last_tool_name)}: ` : ''}
+                                                      {formatInlineTaskEventText(event)}
+                                                    </span>
+                                                  </div>
+                                                ))}
+                                              </div>
+                                            )}
+                                          </div>
+                                        )}
+                                        {childToolCalls.length > 0 && (
+                                          <div className="space-y-1.5">
+                                            {childToolCalls.map((child: any, childIdx: number) => {
+                                              const childStatus = child.status === 'running' && isStale ? 'canceled' : child.status;
+                                              const childResult = formatToolResultPreview(child.result, 1200);
+                                              const childExpanded = child.isExpanded ?? (forceExpandInlineTaskCards && Boolean(childResult));
+                                              const childPreview = formatToolInputPreview(child);
+                                              const childLabel = childPreview && childPreview !== 'unknown'
+                                                ? childPreview
+                                                : (childResult ? 'Task output' : 'Task event');
+                                              return (
+                                                <div key={child.id || childIdx} className="rounded-md border border-black/5 dark:border-white/5 bg-black/[0.03] dark:bg-black/30 overflow-hidden">
+                                                  <div
+                                                    className={`flex items-center justify-between gap-2 px-2 py-1.5 ${childResult ? 'cursor-pointer hover:bg-black/5 dark:hover:bg-white/5' : ''}`}
+                                                    onClick={() => {
+                                                      if (!childResult) return;
+                                                      onSetMessages(prev =>
+                                                        prev.map((m, i) => {
+                                                          if (i !== idx) return m;
+                                                          const newToolCalls = (m.toolCalls || []).map((item: any, itemIdx: number) => {
+                                                            const sameParent = tc.id ? item.id === tc.id : itemIdx === tcIdx;
+                                                            if (!sameParent) return item;
+                                                            return {
+                                                              ...item,
+                                                              childToolCalls: (item.childToolCalls || []).map((nestedChild: any, nestedChildIdx: number) => {
+                                                                const sameChild = child.id ? nestedChild.id === child.id : nestedChildIdx === childIdx;
+                                                                return sameChild ? { ...nestedChild, isExpanded: !childExpanded } : nestedChild;
+                                                              }),
+                                                            };
+                                                          });
+                                                          const orphanSourceId = child.__orphanSourceId ? String(child.__orphanSourceId) : '';
+                                                          const patchedToolCalls = orphanSourceId
+                                                            ? newToolCalls.map((item: any) => (
+                                                                String(item.id || '') === orphanSourceId
+                                                                  ? { ...item, isExpanded: !childExpanded }
+                                                                  : item
+                                                              ))
+                                                            : newToolCalls;
+                                                          return { ...m, toolCalls: patchedToolCalls };
+                                                        })
+                                                      );
+                                                    }}
+                                                  >
+                                                    <div className="flex items-center gap-2 min-w-0">
+                                                      {child.name === 'Bash' ? (
+                                                        <span className="text-claude-textSecondary font-mono font-bold text-[11px]">&gt;_</span>
+                                                      ) : (
+                                                        <FileText size={12} className="text-claude-textSecondary flex-shrink-0" />
+                                                      )}
+                                                      <span className="font-mono text-[11px] text-claude-text truncate">
+                                                        {childLabel}
+                                                      </span>
+                                                    </div>
+                                                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                                                      <span className={`font-mono text-[11px] ${childStatus === 'error' ? 'text-red-400/80' : 'text-claude-textSecondary'}`}>
+                                                        {childStatus === 'running' ? 'Running...' : childStatus || 'done'}
+                                                      </span>
+                                                      {childResult && (
+                                                        <ChevronDown size={12} className={`text-claude-textSecondary transform transition-transform duration-200 ${childExpanded ? 'rotate-180' : ''}`} />
+                                                      )}
+                                                    </div>
+                                                  </div>
+                                                  {childResult && childExpanded && (
+                                                    <div className="border-t border-black/5 dark:border-white/5 px-2 py-1.5 text-[11px] font-mono text-claude-textSecondary whitespace-pre-wrap max-h-[220px] overflow-y-auto">
+                                                      {childResult}
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              );
+                                            })}
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
                                   </div>
                                 )}
                               </div>
@@ -976,7 +1660,7 @@ const MessageList = React.memo<MessageListProps>(({
                   </div>
                 );
               })()}
-              {msg.searchStatus && (!msg.searchLogs || msg.searchLogs.length === 0) && (!msg.content || msg.content.length === (msg._contentLenBeforeSearch || 0)) && loading && idx === messages.length - 1 && (
+              {msg.searchStatus && (!msg.searchLogs || msg.searchLogs.length === 0) && (!messageDisplayContent(msg) || messageDisplayContent(msg).length === (msg._contentLenBeforeSearch || 0)) && loading && idx === messages.length - 1 && (
                 <div className="flex items-center justify-center gap-2 text-[15px] font-medium mb-4 w-full">
                   <Globe size={18} className="text-claude-textSecondary" />
                   <span className="animate-shimmer-text">
@@ -986,14 +1670,17 @@ const MessageList = React.memo<MessageListProps>(({
               )}
 
               {msg.searchLogs && msg.searchLogs.length > 0 && (
-                <SearchProcess logs={msg.searchLogs} isThinking={msg.isThinking} isDone={(msg.content || '').length > (msg._contentLenBeforeSearch || 0)} />
+                <SearchProcess logs={msg.searchLogs} isThinking={msg.isThinking} isDone={messageDisplayContent(msg).length > (msg._contentLenBeforeSearch || 0)} />
               )}
 
               {normalizeDocumentDrafts(msg).length > 0 && (
                 <DocumentCreationProcess drafts={normalizeDocumentDrafts(msg)} />
               )}
 
-              <MarkdownRenderer content={(msg as any)._finalText ?? extractTextContent(msg.content)} citations={msg.citations} />
+              <MarkdownRenderer
+                content={(msg as any)._finalText ?? messageDisplayContent(msg)}
+                citations={msg.citations}
+              />
               {normalizeMessageDocuments(msg).length > 0 && (
                 <div className="mt-2 mb-1 space-y-2">
                   {normalizeMessageDocuments(msg).map((doc, docIdx) => (
@@ -1024,17 +1711,17 @@ const MessageList = React.memo<MessageListProps>(({
                   ))}
                 </div>
               )}
-              {loading && idx === messages.length - 1 && !msg.content && !msg.thinking && !msg.searchStatus && normalizeDocumentDrafts(msg).length === 0 && !(msg.toolCalls && msg.toolCalls.length > 0) && (
+              {loading && idx === messages.length - 1 && !messageDisplayContent(msg) && !msg.thinking && !msg.searchStatus && normalizeDocumentDrafts(msg).length === 0 && !(messageDisplayToolCalls(msg).length > 0) && (
                 <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
                   <ClaudeLogo breathe style={{ width: '40px', height: '40px', display: 'inline-block' }} />
                 </span>
               )}
-              {loading && idx === messages.length - 1 && !msg.isThinking && (msg.content || (msg.searchStatus && msg.content)) && (
+              {loading && idx === messages.length - 1 && !msg.isThinking && (messageDisplayContent(msg) || (msg.searchStatus && messageDisplayContent(msg))) && (
                 <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
                   <ClaudeLogo autoAnimate style={{ width: '40px', height: '40px', display: 'inline-block' }} />
                 </span>
               )}
-              {!loading && idx === messages.length - 1 && msg.content && (
+              {!loading && idx === messages.length - 1 && messageDisplayContent(msg) && compactStatus.state === 'compacting' && (
                 <div className="flex items-start gap-4 mt-6 ml-1 mb-2">
                   <ClaudeLogo breathe={compactStatus.state === 'compacting'} style={{ width: '36px', height: '36px', flexShrink: 0, marginTop: '2px' }} />
                   {compactStatus.state === 'compacting' && <CompactingStatus />}
@@ -1207,6 +1894,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const lastResetKeyRef = useRef(0);
   const streamConversationIdRef = useRef<string | null>(null);
   const streamRequestIdRef = useRef(0);
+  const foregroundReleasedStreamIdsRef = useRef<Set<number>>(new Set());
+  const streamSessionStateRef = useRef(createStreamSessionState());
 
   // Per-conversation message buffer for multi-conversation streaming isolation
   const viewingIdRef = useRef<string | null>(null);
@@ -1246,6 +1935,28 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     } else {
       const prev = messagesBufferRef.current.get(convId) || [];
       messagesBufferRef.current.set(convId, ensureUpdater(prev));
+    }
+  }, []);
+
+  const refreshConversationSnapshot = useCallback(async (convId: string) => {
+    try {
+      const data = await getConversation(convId);
+      if (viewingIdRef.current !== convId) return;
+      if (Array.isArray(data?.messages)) {
+        const serverMessages = data.messages.map((msg: any) => sanitizeInlineArtifactMessage(msg));
+        setMessages(prev => {
+          const merged = mergeFinalConversationMessages(serverMessages, prev);
+          messagesBufferRef.current.delete(convId);
+          return merged;
+        });
+      }
+      if (data?.title) {
+        setConversationTitle(data.title);
+        window.dispatchEvent(new CustomEvent('conversationTitleUpdated'));
+      }
+      getContextSize(convId).then(setContextInfo).catch(() => {});
+    } catch (err) {
+      console.error('[MainContent] Error refreshing final conversation:', err);
     }
   }, []);
 
@@ -1325,7 +2036,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     return () => clearTimeout(t);
   }, [webSearchToast]);
   const [showSkillsSubmenu, setShowSkillsSubmenu] = useState(false);
-  const [enabledSkills, setEnabledSkills] = useState<Array<{ id: string; name: string; description?: string }>>([]);
+  const [enabledSkills, setEnabledSkills] = useState<Array<{ id: string; name: string; commandName: string; description?: string }>>([]);
   const [selectedSkill, setSelectedSkill] = useState<{ name: string; slug: string; description?: string } | null>(null);
   const plusMenuRef = useRef<HTMLDivElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
@@ -1368,9 +2079,9 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   const submitAskUserDialogAnswers = useCallback(async (dialog: NonNullable<typeof askUserDialog>, answers: Record<string, string>) => {
     if (!activeId) return;
-    setAskUserDialog(null);
     try {
       await answerUserQuestion(activeId, dialog.request_id, dialog.tool_use_id, answers);
+      setAskUserDialog(null);
     } catch (err) {
       console.error('Failed to send answer:', err);
     }
@@ -1380,6 +2091,17 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   }, []);
   const handlePermissionSystemEvent = useCallback((event: string, data: any, conversationId: string) => {
     if (event === 'permission_request' && data) {
+      if (String(data.tool_name || '') === 'AskUserQuestion') {
+        setAskUserDialog({
+          request_id: String(data.permission_request_id || ''),
+          tool_use_id: String(data.tool_use_id || data.metadata?.toolUseID || ''),
+          questions: Array.isArray(data.arguments_preview?.questions)
+            ? data.arguments_preview.questions
+            : [],
+          answers: {},
+        });
+        return true;
+      }
       const nextDialog: PermissionDialogState = {
         conversation_id: String(data.conversation_id || conversationId || ''),
         permission_request_id: String(data.permission_request_id || ''),
@@ -1402,10 +2124,27 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
     if (event === 'permission_resolved' && data) {
       setPermissionDialogs(prev => prev.filter(item => item.permission_request_id !== data.permission_request_id));
+      setAskUserDialog(prev => prev && prev.request_id === data.permission_request_id ? null : prev);
       return true;
     }
     return false;
   }, []);
+  const handleForegroundDone = useCallback((conversationId: string, text?: string) => {
+    removeStreaming(conversationId);
+    if (viewingIdRef.current === conversationId) setLoading(false);
+    isCreatingRef.current = false;
+    closePermissionDialogForConversation(conversationId);
+    setMessagesFor(conversationId, prev => {
+      const newMsgs = [...prev];
+      const lastMsg = newMsgs[newMsgs.length - 1];
+      if (lastMsg && lastMsg.role === 'assistant') {
+        if (text) lastMsg.content = text;
+        lastMsg.isThinking = false;
+      }
+      return newMsgs;
+    });
+    void refreshConversationSnapshot(conversationId);
+  }, [closePermissionDialogForConversation, refreshConversationSnapshot, setMessagesFor]);
   const submitPermissionDecision = useCallback(async (
     dialog: PermissionDialogState,
     decision: 'allow_once' | 'allow_session' | 'deny' | 'abort'
@@ -1428,6 +2167,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   // Task/Agent progress state
   const [activeTasks, setActiveTasks] = useState<Map<string, { description: string; status?: string; summary?: string; last_tool_name?: string }>>(new Map());
+
+  const handleTaskSystemEvent = useCallback((conversationId: string, data: any) => {
+    setActiveTasks(prev => {
+      const next = new Map(prev);
+      if (data.subtype === 'task_started') {
+        next.set(data.task_id, { description: data.description || 'Running task...' });
+      } else if (data.subtype === 'task_progress') {
+        const existing = next.get(data.task_id);
+        if (existing) {
+          next.set(data.task_id, { ...existing, last_tool_name: data.last_tool_name, summary: data.summary });
+        }
+      } else if (data.subtype === 'task_notification') {
+        next.delete(data.task_id);
+      }
+      return next;
+    });
+    setMessagesFor(conversationId, prev => applyTaskEventToMessages(prev, data));
+  }, [setMessagesFor]);
 
   // Plan mode state
   const [planMode, setPlanMode] = useState(false);
@@ -1510,7 +2267,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     if (!showPlusMenu) { setShowSkillsSubmenu(false); setShowProjectsSubmenu(false); return; }
     getSkills().then((data: any) => {
       const all = [...(data.examples || []), ...(data.my_skills || [])];
-      setEnabledSkills(all.filter((s: any) => s.enabled).map((s: any) => ({ id: s.id, name: s.name, description: s.description })));
+      setEnabledSkills(all.filter((s: any) => s.enabled && s.userInvocable !== false).map((s: any) => ({
+        id: s.id,
+        name: s.display_name || s.name,
+        commandName: s.command_name || s.source_dir || s.name,
+        description: s.description,
+      })));
     }).catch(() => {});
     getProjects().then((data: Project[]) => {
       setProjectList((data || []).filter(p => !p.is_archived));
@@ -1767,11 +2529,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         const convId = activeId;
         getStreamStatus(convId).then(status => {
           if (status.active && viewingIdRef.current === convId) {
-            setLoading(true);
-            addStreaming(convId);
+            const foregroundActive = status.foregroundActive !== false;
+            setLoading(foregroundActive);
+            if (foregroundActive) addStreaming(convId);
             // Seed buffer from current messages + placeholder
             setMessages(prev => {
               const msgs = prev.length > 0 ? prev : [];
+              if (!foregroundActive) {
+                messagesBufferRef.current.set(convId, msgs);
+                return msgs;
+              }
               // Add assistant placeholder if last message isn't one
               if (msgs.length === 0 || msgs[msgs.length - 1].role !== 'assistant') {
                 const withPlaceholder = [...msgs, { role: 'assistant', content: '' }];
@@ -1805,6 +2572,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   if (lastMsg && lastMsg.role === 'assistant') { lastMsg.content = full; lastMsg.isThinking = false; }
                   return newMsgs;
                 });
+                void refreshConversationSnapshot(convId);
               },
               (err) => {
                 removeStreaming(convId);
@@ -1822,6 +2590,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 });
               },
               (event, message, data) => {
+                if (event === 'foreground_done' && data) {
+                  handleForegroundDone(convId, data.visible_text || data.text || '');
+                  return;
+                }
                 if (handlePermissionSystemEvent(event, data, convId)) {
                   return;
                 }
@@ -1832,47 +2604,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   setAskUserDialog(prev => prev && prev.request_id === data.request_id ? null : prev);
                 }
                 if (event === 'task_event' && data) {
-                  setActiveTasks(prev => {
-                    const next = new Map(prev);
-                    if (data.subtype === 'task_started') next.set(data.task_id, { description: data.description || 'Running task...' });
-                    else if (data.subtype === 'task_progress') { const e = next.get(data.task_id); if (e) next.set(data.task_id, { ...e, last_tool_name: data.last_tool_name }); }
-                    else if (data.subtype === 'task_notification') next.delete(data.task_id);
-                    return next;
-                  });
+                  handleTaskSystemEvent(convId, data);
                 }
               },
               (toolEvent) => {
                 if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
                 if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
-                const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
-                if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
-                setMessagesFor(convId, prev => {
-                  const newMsgs = [...prev];
-                  const lastMsg = newMsgs[newMsgs.length - 1];
-                  if (!lastMsg || lastMsg.role !== 'assistant') return prev;
-                  const toolCalls = lastMsg.toolCalls || [];
-                  if (toolEvent.type === 'start') {
-                    let existing = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
-                    if (existing) {
-                      existing.name = toolEvent.tool_name || existing.name;
-                      if (toolEvent.tool_input && Object.keys(toolEvent.tool_input).length > 0) existing.input = toolEvent.tool_input;
-                      if (toolEvent.textBefore) existing.textBefore = toolEvent.textBefore;
-                    } else {
-                      toolCalls.push({ id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: toolEvent.tool_input || {}, status: 'running' as const, textBefore: toolEvent.textBefore || '' });
-                    }
-                  }
-                  else if (toolEvent.type === 'input') {
-                    const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
-                    if (tc) tc.input = toolEvent.tool_input || {};
-                  }
-                  else if (toolEvent.type === 'done') {
-                    let tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
-                    if (!tc) { tc = { id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: {}, status: 'done' as const, result: toolEvent.content }; toolCalls.push(tc); }
-                    else { tc.status = toolEvent.is_error ? 'error' as const : 'done' as const; tc.result = toolEvent.content; }
-                  }
-                  lastMsg.toolCalls = toolCalls;
-                  return newMsgs;
-                });
+                if (INTERNAL_TOOL_NAMES.has(toolEvent.tool_name || '')) return;
+                setMessagesFor(convId, prev => applyToolEventToMessages(prev, toolEvent));
               },
               reconnectController.signal
             );
@@ -1907,29 +2646,58 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   }, []);
 
   const beginStreamSession = useCallback((conversationId: string) => {
-    const nextId = streamRequestIdRef.current + 1;
-    streamRequestIdRef.current = nextId;
-    streamConversationIdRef.current = conversationId;
+    const nextId = beginTrackedStreamSession(streamSessionStateRef.current, conversationId);
+    streamRequestIdRef.current = streamSessionStateRef.current.requestId;
+    streamConversationIdRef.current = streamSessionStateRef.current.conversationId;
     return nextId;
   }, []);
 
   const isStreamSessionActive = useCallback((conversationId: string, requestId: number) => {
-    return streamConversationIdRef.current === conversationId && streamRequestIdRef.current === requestId;
+    return isTrackedStreamSessionActive(streamSessionStateRef.current, conversationId, requestId);
   }, []);
 
   const clearStreamSession = useCallback((conversationId: string, requestId: number) => {
-    if (!isStreamSessionActive(conversationId, requestId)) return false;
-    streamConversationIdRef.current = null;
+    const cleared = clearTrackedStreamSession(streamSessionStateRef.current, conversationId, requestId);
+    streamRequestIdRef.current = streamSessionStateRef.current.requestId;
+    streamConversationIdRef.current = streamSessionStateRef.current.conversationId;
+    foregroundReleasedStreamIdsRef.current = new Set(streamSessionStateRef.current.releasedForegroundIds);
+    return cleared;
+  }, []);
+
+  const releaseForegroundStream = useCallback((conversationId: string, requestId: number) => {
+    const released = releaseTrackedForegroundStream(streamSessionStateRef.current, conversationId, requestId);
+    if (!released) return false;
+    if (!foregroundReleasedStreamIdsRef.current.has(requestId)) {
+      foregroundReleasedStreamIdsRef.current = new Set(streamSessionStateRef.current.releasedForegroundIds);
+      activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+    }
+    removeStreaming(conversationId);
+    if (viewingIdRef.current === conversationId) setLoading(false);
+    isCreatingRef.current = false;
     return true;
-  }, [isStreamSessionActive]);
+  }, []);
+
+  const isReleasedForegroundStream = useCallback((requestId: number) => {
+    return isTrackedForegroundReleased(streamSessionStateRef.current, requestId);
+  }, []);
+
+  const shouldHandleBackgroundStreamEvent = useCallback((requestId: number, event?: string) => {
+    return shouldHandleTrackedBackgroundStreamEvent(streamSessionStateRef.current, requestId, event);
+  }, []);
+
+  const consumeForegroundRelease = useCallback((requestId: number) => {
+    const consumed = consumeTrackedForegroundRelease(streamSessionStateRef.current, requestId);
+    foregroundReleasedStreamIdsRef.current = new Set(streamSessionStateRef.current.releasedForegroundIds);
+    return consumed;
+  }, []);
 
   const abortStreamSession = useCallback((targetConversationId?: string) => {
-    const trackedConversationId = streamConversationIdRef.current;
+    const trackedConversationId = streamSessionStateRef.current.conversationId;
     if (!trackedConversationId) return false;
-    if (targetConversationId && trackedConversationId !== targetConversationId) return false;
-
-    streamRequestIdRef.current += 1;
-    streamConversationIdRef.current = null;
+    if (!abortTrackedStreamSession(streamSessionStateRef.current, targetConversationId)) return false;
+    streamRequestIdRef.current = streamSessionStateRef.current.requestId;
+    streamConversationIdRef.current = streamSessionStateRef.current.conversationId;
+    foregroundReleasedStreamIdsRef.current = new Set(streamSessionStateRef.current.releasedForegroundIds);
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -2481,10 +3249,21 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (full) => {
         // Always clean up streaming state and request count, even if session changed
-        removeStreaming(conversationId!);
-        messagesBufferRef.current.delete(conversationId!);
-        activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
-        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId!, streamRequestId);
+        if (streamActive) {
+          removeStreaming(conversationId!);
+          messagesBufferRef.current.delete(conversationId!);
+        }
+        const releasedForeground = consumeForegroundRelease(streamRequestId);
+        if (!releasedForeground) {
+          activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        }
+        if (!streamActive) {
+          if (releasedForeground) {
+            void refreshConversationSnapshot(conversationId!);
+          }
+          return;
+        }
         if (viewingIdRef.current === conversationId) setLoading(false);
         abortControllerRef.current = null;
         isCreatingRef.current = false; // Reset flag
@@ -2500,37 +3279,31 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           return newMsgs;
         });
 
-        // Refresh conversation to get generated title (if any)
-        // 标题生成是异步的，可能需要几秒钟，所以需要延迟轮询
+        // Refresh final server state; this also removes stale trailing placeholders.
+        // 标题生成是异步的，可能需要几秒钟，所以需要延迟轮询。
         if (conversationId) {
-          const refreshTitle = async () => {
-            try {
-              const data = await getConversation(conversationId);
-              console.log('[MainContent] Polling title for', conversationId, ':', data?.title);
-              if (data && data.title) {
-                setConversationTitle(data.title);
-                // 使用 CustomEvent 通知侧边栏刷新，避免触发 resetKey 变化
-                window.dispatchEvent(new CustomEvent('conversationTitleUpdated'));
-              }
-            } catch (err) {
-              console.error('[MainContent] Error polling title:', err);
-            }
-          };
-
-          // 立即刷新一次
-          refreshTitle();
-          // 3秒后再刷新一次（此时标题生成应该已完成）
-          setTimeout(refreshTitle, 3000);
-          // 6秒后再刷新一次（备用）
-          setTimeout(refreshTitle, 6000);
+          void refreshConversationSnapshot(conversationId);
+          setTimeout(() => void refreshConversationSnapshot(conversationId), 3000);
+          setTimeout(() => void refreshConversationSnapshot(conversationId), 6000);
         }
       },
       (err) => {
         // Always clean up streaming state and request count, even if session changed
-        removeStreaming(conversationId!);
-        messagesBufferRef.current.delete(conversationId!);
-        activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
-        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId!, streamRequestId);
+        if (streamActive) {
+          removeStreaming(conversationId!);
+          messagesBufferRef.current.delete(conversationId!);
+        }
+        const releasedForeground = consumeForegroundRelease(streamRequestId);
+        if (!releasedForeground) {
+          activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        }
+        if (!streamActive) {
+          if (releasedForeground) {
+            void refreshConversationSnapshot(conversationId!);
+          }
+          return;
+        }
         if (viewingIdRef.current === conversationId) setLoading(false);
         abortControllerRef.current = null;
         isCreatingRef.current = false;
@@ -2559,8 +3332,33 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (event, message, data) => {
-        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId!, streamRequestId);
+        const backgroundEligible = shouldHandleBackgroundStreamEvent(streamRequestId, event);
+        if (!streamActive && !backgroundEligible) return;
+        if (event === 'foreground_done' && data) {
+          if (!streamActive) return;
+          releaseForegroundStream(conversationId!, streamRequestId);
+          handleForegroundDone(conversationId!, data.visible_text || data.text || '');
+          return;
+        }
         if (handlePermissionSystemEvent(event, data, conversationId!)) {
+          return;
+        }
+        if (!streamActive) {
+          if (event === 'ask_user' && data) {
+            setAskUserDialog({
+              request_id: data.request_id,
+              tool_use_id: data.tool_use_id,
+              questions: data.questions || [],
+              answers: {},
+            });
+          }
+          if (event === 'control_request_resolved' && data) {
+            setAskUserDialog(prev => prev && prev.request_id === data.request_id ? null : prev);
+          }
+          if (event === 'task_event' && data) {
+            handleTaskSystemEvent(conversationId!, data);
+          }
           return;
         }
         // Handle metadata (update user message ID)
@@ -2653,20 +3451,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         }
         // Task/Agent progress
         if (event === 'task_event' && data) {
-          setActiveTasks(prev => {
-            const next = new Map(prev);
-            if (data.subtype === 'task_started') {
-              next.set(data.task_id, { description: data.description || 'Running task...' });
-            } else if (data.subtype === 'task_progress') {
-              const existing = next.get(data.task_id);
-              if (existing) {
-                next.set(data.task_id, { ...existing, last_tool_name: data.last_tool_name, summary: data.summary });
-              }
-            } else if (data.subtype === 'task_notification') {
-              next.delete(data.task_id);
-            }
-            return next;
-          });
+          handleTaskSystemEvent(conversationId!, data);
         }
       },
       (sources, query, tokens) => {
@@ -2797,59 +3582,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       // Handle tool use events from SDK
       (toolEvent) => {
-        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId!, streamRequestId);
+        if (!streamActive && !isReleasedForegroundStream(streamRequestId)) return;
 
         // Track plan mode from tool events
-        if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
-        if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+        if (streamActive && toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
+        if (streamActive && toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
 
         // Don't add internal tools to UI tool list
-        const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
-        if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
-
-        setMessagesFor(conversationId!, prev => {
-          const newMsgs = [...prev];
-          const lastMsg = newMsgs[newMsgs.length - 1];
-          if (!lastMsg || lastMsg.role !== 'assistant') return prev;
-
-          const toolCalls = lastMsg.toolCalls || [];
-
-          if (toolEvent.type === 'start') {
-            // Dedupe by id (we may receive a placeholder tool_use_start before
-            // the input has finished streaming, then a tool_use_input later)
-            let existing = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
-            if (existing) {
-              existing.name = toolEvent.tool_name || existing.name;
-              if (toolEvent.tool_input && Object.keys(toolEvent.tool_input).length > 0) existing.input = toolEvent.tool_input;
-              if (toolEvent.textBefore) existing.textBefore = toolEvent.textBefore;
-            } else {
-              toolCalls.push({
-                id: toolEvent.tool_use_id,
-                name: toolEvent.tool_name || 'unknown',
-                input: toolEvent.tool_input || {},
-                status: 'running' as const,
-                textBefore: toolEvent.textBefore || '',
-              });
-            }
-          } else if (toolEvent.type === 'input') {
-            // Update an existing tool's input after the JSON has fully streamed
-            const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
-            if (tc) tc.input = toolEvent.tool_input || {};
-          } else if (toolEvent.type === 'done') {
-            let tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
-            if (!tc) {
-              // tool_use_start was missed — back-fill the entry so the card still renders
-              tc = { id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: {}, status: 'done' as const, result: toolEvent.content };
-              toolCalls.push(tc);
-            } else {
-              tc.status = toolEvent.is_error ? 'error' as const : 'done' as const;
-              tc.result = toolEvent.content;
-            }
-          }
-
-          lastMsg.toolCalls = toolCalls;
-          return newMsgs;
-        });
+        if (INTERNAL_TOOL_NAMES.has(toolEvent.tool_name || '')) return;
+        setMessagesFor(conversationId!, prev => applyToolEventToMessages(prev, toolEvent));
       },
       controller.signal
     );
@@ -3000,10 +3742,21 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (full) => {
         // Always clean up streaming state and request count
-        removeStreaming(conversationId);
-        messagesBufferRef.current.delete(conversationId);
-        activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
-        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId, streamRequestId);
+        if (streamActive) {
+          removeStreaming(conversationId);
+          messagesBufferRef.current.delete(conversationId);
+        }
+        const releasedForeground = consumeForegroundRelease(streamRequestId);
+        if (!releasedForeground) {
+          activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        }
+        if (!streamActive) {
+          if (releasedForeground) {
+            void refreshConversationSnapshot(conversationId);
+          }
+          return;
+        }
         if (viewingIdRef.current === conversationId) setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
@@ -3017,12 +3770,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           }
           return newMsgs;
         });
+        void refreshConversationSnapshot(conversationId);
       },
       (err) => {
         // Always clean up streaming state and request count
-        removeStreaming(conversationId);
-        activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
-        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId, streamRequestId);
+        if (streamActive) {
+          removeStreaming(conversationId);
+        }
+        const releasedForeground = consumeForegroundRelease(streamRequestId);
+        if (!releasedForeground) {
+          activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        }
+        if (!streamActive) {
+          if (releasedForeground) {
+            void refreshConversationSnapshot(conversationId);
+          }
+          return;
+        }
         setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
@@ -3050,8 +3815,33 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (event, message, data) => {
-        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId, streamRequestId);
+        const backgroundEligible = shouldHandleBackgroundStreamEvent(streamRequestId, event);
+        if (!streamActive && !backgroundEligible) return;
+        if (event === 'foreground_done' && data) {
+          if (!streamActive) return;
+          releaseForegroundStream(conversationId, streamRequestId);
+          handleForegroundDone(conversationId, data.visible_text || data.text || '');
+          return;
+        }
         if (handlePermissionSystemEvent(event, data, conversationId)) {
+          return;
+        }
+        if (!streamActive) {
+          if (event === 'ask_user' && data) {
+            setAskUserDialog({
+              request_id: data.request_id,
+              tool_use_id: data.tool_use_id,
+              questions: data.questions || [],
+              answers: {},
+            });
+          }
+          if (event === 'control_request_resolved' && data) {
+            setAskUserDialog(prev => prev && prev.request_id === data.request_id ? null : prev);
+          }
+          if (event === 'task_event' && data) {
+            handleTaskSystemEvent(conversationId, data);
+          }
           return;
         }
         if (event === 'metadata' && data && data.user_message_id) {
@@ -3090,6 +3880,20 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         if (event && event.startsWith('research_')) {
           setMessages(prev => applyResearchEvent(prev, event, data));
         }
+        if (event === 'ask_user' && data) {
+          setAskUserDialog({
+            request_id: data.request_id,
+            tool_use_id: data.tool_use_id,
+            questions: data.questions || [],
+            answers: {},
+          });
+        }
+        if (event === 'control_request_resolved' && data) {
+          setAskUserDialog(prev => prev && prev.request_id === data.request_id ? null : prev);
+        }
+        if (event === 'task_event' && data) {
+          handleTaskSystemEvent(conversationId, data);
+        }
       },
       undefined,
       (doc) => {
@@ -3115,7 +3919,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       undefined,
-      undefined,
+      (toolEvent) => {
+        const streamActive = isStreamSessionActive(conversationId, streamRequestId);
+        if (!streamActive && !isReleasedForegroundStream(streamRequestId)) return;
+        if (streamActive && toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
+        if (streamActive && toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+        if (INTERNAL_TOOL_NAMES.has(toolEvent.tool_name || '')) return;
+        setMessagesFor(conversationId, prev => applyToolEventToMessages(prev, toolEvent));
+      },
       controller.signal
     );
   };
@@ -3207,10 +4018,21 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       (full) => {
         // Always clean up streaming state and request count
-        removeStreaming(conversationId);
-        messagesBufferRef.current.delete(conversationId);
-        activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
-        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId, streamRequestId);
+        if (streamActive) {
+          removeStreaming(conversationId);
+          messagesBufferRef.current.delete(conversationId);
+        }
+        const releasedForeground = consumeForegroundRelease(streamRequestId);
+        if (!releasedForeground) {
+          activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        }
+        if (!streamActive) {
+          if (releasedForeground) {
+            void refreshConversationSnapshot(conversationId);
+          }
+          return;
+        }
         if (viewingIdRef.current === conversationId) setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
@@ -3224,12 +4046,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           }
           return newMsgs;
         });
+        void refreshConversationSnapshot(conversationId);
       },
       (err) => {
         // Always clean up streaming state and request count
-        removeStreaming(conversationId);
-        activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
-        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId, streamRequestId);
+        if (streamActive) {
+          removeStreaming(conversationId);
+        }
+        const releasedForeground = consumeForegroundRelease(streamRequestId);
+        if (!releasedForeground) {
+          activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
+        }
+        if (!streamActive) {
+          if (releasedForeground) {
+            void refreshConversationSnapshot(conversationId);
+          }
+          return;
+        }
         setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
@@ -3257,8 +4091,33 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       (event, message, data) => {
-        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+        const streamActive = isStreamSessionActive(conversationId, streamRequestId);
+        const backgroundEligible = shouldHandleBackgroundStreamEvent(streamRequestId, event);
+        if (!streamActive && !backgroundEligible) return;
+        if (event === 'foreground_done' && data) {
+          if (!streamActive) return;
+          releaseForegroundStream(conversationId, streamRequestId);
+          handleForegroundDone(conversationId, data.visible_text || data.text || '');
+          return;
+        }
         if (handlePermissionSystemEvent(event, data, conversationId)) {
+          return;
+        }
+        if (!streamActive) {
+          if (event === 'ask_user' && data) {
+            setAskUserDialog({
+              request_id: data.request_id,
+              tool_use_id: data.tool_use_id,
+              questions: data.questions || [],
+              answers: {},
+            });
+          }
+          if (event === 'control_request_resolved' && data) {
+            setAskUserDialog(prev => prev && prev.request_id === data.request_id ? null : prev);
+          }
+          if (event === 'task_event' && data) {
+            handleTaskSystemEvent(conversationId, data);
+          }
           return;
         }
         if (event === 'metadata' && data && data.user_message_id) {
@@ -3297,6 +4156,20 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         if (event && event.startsWith('research_')) {
           setMessages(prev => applyResearchEvent(prev, event, data));
         }
+        if (event === 'ask_user' && data) {
+          setAskUserDialog({
+            request_id: data.request_id,
+            tool_use_id: data.tool_use_id,
+            questions: data.questions || [],
+            answers: {},
+          });
+        }
+        if (event === 'control_request_resolved' && data) {
+          setAskUserDialog(prev => prev && prev.request_id === data.request_id ? null : prev);
+        }
+        if (event === 'task_event' && data) {
+          handleTaskSystemEvent(conversationId, data);
+        }
       },
       undefined,
       (doc) => {
@@ -3322,7 +4195,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       undefined,
-      undefined,
+      (toolEvent) => {
+        const streamActive = isStreamSessionActive(conversationId, streamRequestId);
+        if (!streamActive && !isReleasedForegroundStream(streamRequestId)) return;
+        if (streamActive && toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
+        if (streamActive && toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+        if (INTERNAL_TOOL_NAMES.has(toolEvent.tool_name || '')) return;
+        setMessagesFor(conversationId, prev => applyToolEventToMessages(prev, toolEvent));
+      },
       controller.signal
     );
   };
@@ -3794,7 +4674,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                                 key={skill.id}
                                 onClick={() => {
                                   setShowPlusMenu(false); setShowSkillsSubmenu(false);
-                                  const slug = skill.name.toLowerCase().replace(/\s+/g, '-');
+                                  const slug = skill.commandName;
                                   setSelectedSkill({ name: skill.name, slug, description: skill.description });
                                   setInputText(prev => prev ? `/${slug} ${prev}` : `/${slug} `);
                                   inputRef.current?.focus();
@@ -4126,7 +5006,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                                   onClick={() => {
                                     setShowPlusMenu(false);
                                     setShowSkillsSubmenu(false);
-                                    const slug = skill.name.toLowerCase().replace(/\s+/g, '-');
+                                    const slug = skill.commandName;
                                     setSelectedSkill({ name: skill.name, slug, description: skill.description });
                                     setInputText(prev => prev ? `/${slug} ${prev}` : `/${slug} `);
                                     inputRef.current?.focus();
@@ -4639,7 +5519,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                     setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
                   } catch (err) {
                     console.error('Compact failed:', err);
-                    setCompactStatus({ state: 'error', message: 'Compaction failed' });
+                    const message = err instanceof Error ? err.message : 'Compaction failed';
+                    setCompactStatus({ state: 'error', message });
                     setTimeout(() => setCompactStatus({ state: 'idle' }), 3000);
                   }
                 }}
