@@ -28,3 +28,16 @@ export function toolCallHasInlineTaskDetails(toolCall: any): boolean {
 export function messageHasInlineTaskDetails(toolCalls: any[]): boolean {
   return (toolCalls || []).some((toolCall) => toolCallHasInlineTaskDetails(toolCall));
 }
+
+export function shouldDefaultExpandInlineTaskCard(toolCall: any, isRunning: boolean, forceExpand = false): boolean {
+  if (!toolCallHasInlineTaskDetails(toolCall)) return false;
+  if (isRunning) return true;
+  if (forceExpand) return true;
+  const subagent = toolCall?.subagent || {};
+  return Boolean(
+    Array.isArray(subagent?.events) && subagent.events.length > 0
+    || subagent?.summary
+    || subagent?.result
+    || subagent?.workflow_progress?.length
+  );
+}

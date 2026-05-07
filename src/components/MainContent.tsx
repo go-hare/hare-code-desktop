@@ -43,6 +43,7 @@ import {
 import {
   getInlineTaskDebugExpandFlag,
   messageHasInlineTaskDetails,
+  shouldDefaultExpandInlineTaskCard,
 } from '../utils/inlineTaskDebug';
 
 function formatChatError(err: string): string {
@@ -1438,13 +1439,10 @@ const MessageList = React.memo<MessageListProps>(({
                           const taskDetail = hasTaskDetails ? getInlineTaskDetail(tc.subagent, realStatus) : null;
                           const taskHeader = hasTaskDetails ? getInlineTaskLabel(tc.subagent, taskDetail?.typeLabel || toolDisplayName(tc.name)) : '';
                           const expandable = hasTaskDetails || hasExpandableContent(tc.name, tc.input, tc.result);
-                          const expanded = tc.isExpanded ?? (
-                            hasTaskDetails
-                            && (
-                              realStatus === 'running'
-                              || childToolCalls.length > 0
-                              || forceExpandInlineTaskCards
-                            )
+                          const expanded = tc.isExpanded ?? shouldDefaultExpandInlineTaskCard(
+                            tc,
+                            realStatus === 'running',
+                            forceExpandInlineTaskCards,
                           );
                           const stats = getToolStats(tc.name, tc.input);
                           const toolLabel = inputPreview

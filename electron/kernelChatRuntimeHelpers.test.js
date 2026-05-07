@@ -251,8 +251,9 @@ describe('kernelChatRuntimeHelpers', () => {
       env: { CLAUDE_CODE_TMPDIR: '/tmp' },
     });
 
-    expect(outputFile).toContain('/claude-');
-    expect(outputFile).toContain('/-Users-apple-Downloads-codex-oauth-automation-extension-master/session-1/tasks/task-1.output');
+    const normalized = outputFile.replace(/\\/g, '/');
+    expect(normalized).toContain('/claude/');
+    expect(normalized).toContain('/-Users-apple-Downloads-codex-oauth-automation-extension-master/session-1/tasks/task-1.output');
   });
 
   test('stores and retrieves recent kernel run snapshots by run id and latest conversation', () => {

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   isInlineTaskDebugExpandEnabled,
   messageHasInlineTaskDetails,
+  shouldDefaultExpandInlineTaskCard,
   toolCallHasInlineTaskDetails,
 } from './inlineTaskDebug';
 
@@ -22,5 +23,16 @@ describe('inlineTaskDebug', () => {
       { name: 'Read', input: { path: '/tmp/x' } },
       { name: 'Agent', subagent: { status: 'running' } },
     ])).toBe(true);
+  });
+
+  test('defaults to expanded for completed agent cards that still carry execution details', () => {
+    expect(shouldDefaultExpandInlineTaskCard({
+      name: 'Agent',
+      subagent: {
+        status: 'completed',
+        summary: '已完成。',
+        events: [{ subtype: 'task_notification' }],
+      },
+    }, false)).toBe(true);
   });
 });

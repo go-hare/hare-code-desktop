@@ -116,6 +116,16 @@ describe('inlineTaskPresentation', () => {
     expect(text).toBe('这是最终结论，不需要再从工具结果里回填。');
   });
 
+  test('treats completed agent cards with task details as expandable', () => {
+    expect(getInlineTaskLabel({
+      task_type: 'local_agent',
+      description: 'Scan project architecture',
+      status: 'completed',
+      summary: '已完成项目结构梳理。',
+      events: [{ subtype: 'task_started', description: 'Kernel task started' }],
+    }, 'Agent')).toBe('Agent Scan project architecture');
+  });
+
   test('treats parallel analysis starter copy as replaceable starter text', () => {
     const text = selectVisibleAssistantText(
       '我先从两个方向并行看一下这个仓库：一边梳理整体架构和主要模块，一边检查当前分支上的改动在做什么。',
